@@ -2,7 +2,16 @@
 name = "sysfsd"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "a bridge between netidx and sysfs"
 
 [dependencies]
+netidx = { version = "0.11", path = "../netidx/netidx" }
+netidx-tools = {version = "0.11", path = "../netidx/netidx-tools" }
+tokio = { version = "1", features = ["full"] }
+tokio-uring = "0.3"
+log = "0.4"
+env_logger = "0.9"
+anyhow = "1"
+lazy_static = "1"
+fxhash = "0.2"
+structopt = "0.3"
