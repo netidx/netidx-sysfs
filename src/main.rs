@@ -2,20 +2,20 @@
 extern crate lazy_static;
 
 mod sysfs;
-use crate::sysfs::{FType, Files, Poller, Fid};
-use futures::{prelude::*, select_biased, channel::mpsc};
+use crate::sysfs::{FType, Fid, Files, Poller};
 use anyhow::Result;
-use log::{error, warn};
+use futures::{channel::mpsc, prelude::*, select_biased};
 use fxhash::FxHashMap;
+use log::warn;
 use netidx::{
     path::Path,
-    publisher::{BindCfg, DefaultHandle, Id, Publisher, Val, PublishFlags, Event},
-    utils::{Batched, BatchItem},
+    publisher::{BindCfg, DefaultHandle, Event, Id, PublishFlags, Publisher, Val},
+    utils::{BatchItem, Batched},
 };
 use netidx_tools::ClientParams;
-use std::{collections::HashMap, ops::Bound, path::PathBuf, time::Duration, mem};
+use std::{collections::HashMap, mem, ops::Bound, path::PathBuf, time::Duration};
 use structopt::StructOpt;
-use tokio::{self, task};
+use tokio;
 
 #[derive(StructOpt, Debug)]
 struct Params {
@@ -58,7 +58,7 @@ impl Published {
             None => self.advertised.get_mut(path),
         }
     }
-    
+
     fn advertise(base: &Path, files: &Files, dp: &DefaultHandle) -> Self {
         let mut t = Published {
             published: HashMap::default(),
@@ -123,7 +123,10 @@ impl Published {
                                         }
                                         t.aliased.insert(src_path, tgt_path);
                                     } else {
-                                        warn!("symlink to missing path {} -> {}", src_path, tgt_path)
+                                        warn!(
+                                            "symlink to missing path {} -> {}",
+                                            src_path, tgt_path
+                                        )
                                     }
                                 }
                             }
