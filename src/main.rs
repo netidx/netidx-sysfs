@@ -9,7 +9,7 @@ use log::{error, warn};
 use fxhash::FxHashMap;
 use netidx::{
     path::Path,
-    publisher::{BindCfg, DefaultHandle, Id, Publisher, Val, PublishFlags},
+    publisher::{BindCfg, DefaultHandle, Id, Publisher, Val, PublishFlags, Event},
     utils::{Batched, BatchItem},
 };
 use netidx_tools::ClientParams;
@@ -44,7 +44,7 @@ fn netidx_path<P: AsRef<std::path::Path>>(base: &Path, path: P) -> Path {
 }
 
 struct Published {
-    published: FxHashMap<Id, Val>,
+    published: FxHashMap<Id, (Path, Val)>,
     by_fid: FxHashMap<Fid, Id>,
     advertised: HashMap<Path, (PathBuf, Option<Id>)>,
     aliased: HashMap<Path, Path>,
@@ -145,6 +145,8 @@ async fn main() -> Result<()> {
     let files = sysfs::Files::new(opts.sysfs)?;
     let publisher = Publisher::new(cfg, auth, opts.bind).await?;
     let (tx_updates, rx_updates) = mpsc::unbounded();
+    let (tx_events, mut rx_events) = mpsc::unbounded();
+    publisher.events(tx_events);
     let mut rx_updates = Batched::new(rx_updates, 10_000);
     let poller = Poller::new(tx_updates);
     let mut dp = publisher.publish_default(opts.base.clone())?;
@@ -167,7 +169,7 @@ async fn main() -> Result<()> {
                                 Ok(val) => {
                                     let vid = val.id();
                                     *id = Some(vid);
-                                    published.published.insert(vid, val);
+                                    published.published.insert(vid, (p.clone(), val));
                                     published.by_fid.insert(fid, vid);
                                     let _ = reply.send(());
                                 }
@@ -181,7 +183,7 @@ async fn main() -> Result<()> {
                     None => poller.stop(fid)?,
                     Some(id) => match published.published.get(id) {
                         None => poller.stop(fid)?,
-                        Some(val) => val.update_changed(&mut updates, v),
+                        Some((_, val)) => val.update_changed(&mut updates, v),
                     }
                 }
                 BatchItem::EndBatch => {
@@ -189,6 +191,16 @@ async fn main() -> Result<()> {
                     up.commit(timeout).await
                 }
             },
+            e = rx_events.select_next_some() => match e {
+                Event::Subscribe(_, _) | Event::Unsubscribe(_, _) => (),
+                Event::Destroyed(id) => {
+                    if let Some((p, _)) = published.published.remove(&id) {
+                        if let Some((_, ref mut id)) = published.resolve(&p) {
+                            *id = None;
+                        }
+                    }
+                }
+            }
         }
     }
 }

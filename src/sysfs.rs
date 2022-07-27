@@ -14,7 +14,7 @@ use netidx::{
     publisher::Value,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     time::Duration,
