@@ -9,89 +9,14 @@ use futures::{
 };
 use fxhash::FxHashMap;
 use log::error;
-use netidx::{
-    pool::{Pool, Pooled},
-    publisher::Value,
-};
+use netidx::publisher::Value;
 use std::{
     collections::{BTreeMap, HashMap},
-    ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
 use tokio::{sync::broadcast, time};
-use tokio_uring::{
-    self,
-    buf::{IoBuf, IoBufMut},
-    fs::File,
-};
-
-struct Buf(Pooled<Vec<u8>>);
-
-impl Deref for Buf {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.0
-    }
-}
-
-impl DerefMut for Buf {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.0
-    }
-}
-
-unsafe impl IoBuf for Buf {
-    fn stable_ptr(&self) -> *const u8 {
-        self.0.stable_ptr()
-    }
-
-    fn bytes_init(&self) -> usize {
-        self.0.bytes_init()
-    }
-
-    fn bytes_total(&self) -> usize {
-        self.0.bytes_total()
-    }
-}
-
-unsafe impl IoBufMut for Buf {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.0.stable_mut_ptr()
-    }
-
-    unsafe fn set_init(&mut self, pos: usize) {
-        self.0.set_init(pos)
-    }
-}
-
-lazy_static! {
-    static ref BUF: Pool<Vec<u8>> = Pool::new(100_000, 4096);
-}
-
-async fn read_file(file: &Path) -> Result<Buf> {
-    const C: usize = 512;
-    let fd = File::open(file).await?;
-    let mut pos = 0;
-    let mut buf = Buf(BUF.take());
-    loop {
-        {
-            let len = buf.len();
-            if dbg!(len) - dbg!(pos) < C {
-                buf.resize(dbg!(len + C), 0);
-            }
-        }
-        let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
-        let read = read?;
-        if read == 0 {
-            return Ok(res.into_inner());
-        } else {
-            buf = res.into_inner();
-            pos += read;
-        }
-    }
-}
+use tokio_uring::{self, buf::IoBuf, fs::File};
 
 pub(crate) async fn poll_file(
     file: PathBuf,
@@ -101,6 +26,8 @@ pub(crate) async fn poll_file(
     mut clock: broadcast::Receiver<()>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
+    const SZ: usize = 64;
+    let mut buf = vec![0; SZ];
     let mut first = Some(first);
     let mut send = |v: Value| -> Result<()> {
         match first.take() {
@@ -112,13 +39,31 @@ pub(crate) async fn poll_file(
         }
     };
     loop {
-        let data = read_file(&file).await?;
-        let data = String::from_utf8_lossy(&**data);
-        match data.parse::<i64>() {
+        let pos = {
+            let fd = File::open(&file).await?;
+            let mut pos = 0;
+            loop {
+                let len = buf.len();
+                if len - pos < SZ {
+                    buf.resize(len * 2, 0);
+                }
+                let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
+                let read = read?;
+                if read == 0 {
+                    buf = res.into_inner();
+                    break pos;
+                } else {
+                    buf = res.into_inner();
+                    pos += read;
+                }
+            }
+        };
+        let data = String::from_utf8_lossy(&buf[0..pos]);
+        match data.trim().parse::<i64>() {
             Ok(i) => send(Value::from(i))?,
-            Err(_) => match data.parse::<f64>() {
+            Err(_) => match data.trim().parse::<f64>() {
                 Ok(f) => send(Value::from(f))?,
-                Err(_) => send(Value::from(data.into_owned()))?,
+                Err(_) => send(Value::from(String::from(data.trim())))?,
             },
         }
         select_biased! {

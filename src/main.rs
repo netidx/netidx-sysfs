@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate lazy_static;
-
 mod sysfs;
 use crate::sysfs::{FType, Fid, Files, Poller};
 use anyhow::Result;
