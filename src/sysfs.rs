@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{sync::broadcast, task::JoinHandle, time};
+use tokio::{sync::broadcast, time};
 use tokio_uring::{
     self,
     buf::{IoBuf, IoBufMut},
@@ -78,8 +78,8 @@ async fn read_file(file: &Path) -> Result<Buf> {
     loop {
         {
             let len = buf.len();
-            if len - pos < C {
-                buf.resize(len + C, 0);
+            if dbg!(len) - dbg!(pos) < C {
+                buf.resize(dbg!(len + C), 0);
             }
         }
         let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
@@ -99,6 +99,7 @@ pub(crate) async fn poll_file(
     updates: UnboundedSender<(Fid, Value)>,
     first: oneshot::Sender<Value>,
     mut clock: broadcast::Receiver<()>,
+    mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
     let mut first = Some(first);
     let mut send = |v: Value| -> Result<()> {
@@ -120,8 +121,11 @@ pub(crate) async fn poll_file(
                 Err(_) => send(Value::from(data.into_owned()))?,
             },
         }
-        if let Err(_) = clock.recv().await {
-            break Ok(());
+        select_biased! {
+            _ = stop => break Ok(()),
+            r = clock.recv().fuse() => if let Err(_) = r {
+                break Ok(());
+            }
         }
     }
 }
@@ -150,7 +154,7 @@ impl Poller {
         mut req: mpsc::UnboundedReceiver<FileReq>,
     ) -> Result<()> {
         let (clock, _) = broadcast::channel(3);
-        let mut polling: FxHashMap<Fid, JoinHandle<Result<()>>> = HashMap::default();
+        let mut polling: FxHashMap<Fid, oneshot::Sender<()>> = HashMap::default();
         let mut clock_timer = time::interval(Duration::from_secs(1));
         loop {
             select_biased! {
@@ -160,14 +164,15 @@ impl Poller {
                 r = req.select_next_some() => match r {
                     FileReq::StartPolling(id, path, first) => {
                         let clock = clock.subscribe();
-                        let jh = tokio_uring::spawn(
-                            poll_file(path, id, updates.clone(), first, clock)
+                        let (tx_stop, rx_stop) = oneshot::channel();
+                        tokio_uring::spawn(
+                            poll_file(path, id, updates.clone(), first, clock, rx_stop)
                         );
-                        polling.insert(id, jh);
+                        polling.insert(id, tx_stop);
                     }
                     FileReq::StopPolling(id) => {
-                        if let Some(jh) = polling.remove(&id) {
-                            jh.abort();
+                        if let Some(stop) = polling.remove(&id) {
+                            let _ = stop.send(());
                         }
                     }
                 }
