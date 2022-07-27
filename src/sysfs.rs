@@ -209,7 +209,7 @@ impl Files {
         use std::fs;
         let st = fs::symlink_metadata(&path)?;
         if st.is_symlink() {
-            let target = fs::read_link(&path)?;
+            let target = fs::canonicalize(&path)?;
             self.symlinks.insert(path, target);
         } else if st.is_dir() {
             for ent in fs::read_dir(&path)? {
