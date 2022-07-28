@@ -36,10 +36,6 @@ struct Params {
     sysfs: PathBuf,
 }
 
-fn netidx_path<P: AsRef<std::path::Path>>(base: &Path, path: P) -> Path {
-    base.append(&path.as_ref().as_os_str().to_string_lossy())
-}
-
 struct Published {
     published: FxHashMap<Id, (Path, Val)>,
     by_fid: FxHashMap<Fid, Id>,
@@ -67,7 +63,7 @@ impl Published {
             match typ {
                 FType::Directory => (),
                 FType::File => {
-                    let npath = netidx_path(base, path);
+                    let npath = files.netidx_path(base, path);
                     if let Err(e) = dp.advertise(npath.clone()) {
                         warn!("failed to advertise path {}, {}", npath, e)
                     }
@@ -82,8 +78,8 @@ impl Published {
                 }
                 Ok((tgt, typ)) => match typ {
                     FType::File => {
-                        let src_path = netidx_path(base, src);
-                        let tgt_path = netidx_path(base, tgt);
+                        let src_path = files.netidx_path(base, src);
+                        let tgt_path = files.netidx_path(base, tgt);
                         if t.advertised.contains_key(&tgt_path) {
                             if let Err(e) = dp.advertise(src_path.clone()) {
                                 warn!("failed to advertise path {}, {}", src_path, e)
@@ -94,8 +90,8 @@ impl Published {
                         }
                     }
                     FType::Directory => {
-                        let src_path = netidx_path(base, src);
-                        let tgt_path = netidx_path(base, tgt);
+                        let src_path = files.netidx_path(base, src);
+                        let tgt_path = files.netidx_path(base, tgt);
                         let children = files
                             .paths
                             .range::<std::path::Path, (Bound<&std::path::Path>, Bound<&std::path::Path>)>((
@@ -112,8 +108,8 @@ impl Published {
                             match typ {
                                 FType::Directory => (),
                                 FType::File => {
-                                    let src_path = netidx_path(&src_path, p);
-                                    let tgt_path = netidx_path(&tgt_path, p);
+                                    let src_path = files.netidx_path(&src_path, p);
+                                    let tgt_path = files.netidx_path(&tgt_path, p);
                                     if t.advertised.contains_key(&tgt_path) {
                                         if let Err(e) = dp.advertise(src_path.clone()) {
                                             warn!("failed to advertise path {}, {}", src_path, e)

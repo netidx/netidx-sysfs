@@ -9,7 +9,8 @@ use futures::{
 };
 use fxhash::FxHashMap;
 use log::error;
-use netidx::publisher::Value;
+use netidx::{publisher::Value, path::Path as NPath};
+use bytes::Bytes;
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -58,13 +59,15 @@ pub(crate) async fn poll_file(
                 }
             }
         };
-        let data = String::from_utf8_lossy(&buf[0..pos]);
-        match data.trim().parse::<i64>() {
-            Ok(i) => send(Value::from(i))?,
-            Err(_) => match data.trim().parse::<f64>() {
-                Ok(f) => send(Value::from(f))?,
-                Err(_) => send(Value::from(String::from(data.trim())))?,
-            },
+        match std::str::from_utf8(&buf[0..pos]) {
+            Err(_) => send(Value::from(Bytes::copy_from_slice(&buf[0..pos])))?,
+            Ok(data) => match data.trim().parse::<i64>() {
+                Ok(i) => send(Value::from(i))?,
+                Err(_) => match data.trim().parse::<f64>() {
+                    Ok(f) => send(Value::from(f))?,
+                    Err(_) => send(Value::from(String::from(data.trim())))?,
+                },
+            }
         }
         select_biased! {
             _ = stop => break Ok(()),
@@ -166,15 +169,17 @@ pub(crate) enum FType {
 pub(crate) struct Files {
     pub(crate) paths: BTreeMap<PathBuf, FType>,
     pub(crate) symlinks: BTreeMap<PathBuf, PathBuf>,
+    pub(crate) base: PathBuf,
 }
 
 impl Files {
-    pub(crate) fn new(path: PathBuf) -> Result<Self> {
+    pub(crate) fn new(base: PathBuf) -> Result<Self> {
         let mut t = Self {
             paths: BTreeMap::default(),
             symlinks: BTreeMap::default(),
+            base: base.clone(),
         };
-        t.walk(path)?;
+        t.walk(base)?;
         Ok(t)
     }
 
@@ -203,6 +208,14 @@ impl Files {
         target: &'b PathBuf,
     ) -> Result<(&'a PathBuf, FType)> {
         self.resolve_(target, 0)
+    }
+
+    pub(crate) fn netidx_path<P: AsRef<std::path::Path>>(&self, base: &NPath, path: P) -> NPath {
+        let path = match path.as_ref().strip_prefix(&self.base) {
+            Ok(p) => p,
+            Err(_) => path.as_ref(),
+        };
+        base.append(&path.as_os_str().to_string_lossy())
     }
 
     fn walk(&mut self, path: PathBuf) -> Result<()> {
