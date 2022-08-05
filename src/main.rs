@@ -1,3 +1,6 @@
+#[macro_use] extern crate serde_derive;
+
+//mod config;
 mod sysfs;
 use crate::sysfs::{FType, Fid, Files, Poller};
 use anyhow::Result;
@@ -10,7 +13,7 @@ use netidx::{
     utils::{BatchItem, Batched},
 };
 use netidx_tools::ClientParams;
-use std::{collections::HashMap, mem, ops::Bound, path::PathBuf, time::Duration};
+use std::{collections::HashMap, mem, ops::Bound, path::PathBuf, time::{Instant, Duration}};
 use structopt::StructOpt;
 use tokio;
 
@@ -32,7 +35,7 @@ struct Params {
     timeout: Option<u64>,
     #[structopt(long = "base", help = "the base path to publish under")]
     base: Path,
-    #[structopt(long = "sysfs", help = "the path to sysfs", default_value = "/sys")]
+    #[structopt(long = "sysfs", help = "glob pattern of files to publish, multiple")]
     sysfs: PathBuf,
 }
 
@@ -138,7 +141,9 @@ async fn main() -> Result<()> {
     let opts = Params::from_args();
     let (cfg, auth) = opts.common.load();
     let timeout = opts.timeout.map(Duration::from_secs);
-    let files = sysfs::Files::new(opts.sysfs)?;
+    let st = Instant::now();
+    let files = sysfs::Files::new(opts.sysfs);
+    dbg!(st.elapsed());
     let publisher = Publisher::new(cfg, auth, opts.bind).await?;
     let (tx_updates, rx_updates) = mpsc::unbounded();
     let (tx_events, mut rx_events) = mpsc::unbounded();

@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use bytes::Bytes;
 use futures::{
     channel::{
         mpsc::{self, UnboundedSender},
@@ -8,16 +9,44 @@ use futures::{
     select_biased,
 };
 use fxhash::FxHashMap;
-use log::error;
-use netidx::{publisher::Value, path::Path as NPath};
-use bytes::Bytes;
+use log::{error, warn};
+use netidx::{path::Path as NPath, publisher::Value};
 use std::{
+    cmp::max,
     collections::{BTreeMap, HashMap},
+    ops::Bound,
+    os::linux::fs::MetadataExt,
     path::PathBuf,
     time::Duration,
 };
 use tokio::{sync::broadcast, time};
 use tokio_uring::{self, buf::IoBuf, fs::File};
+
+const SZ: usize = 64;
+
+async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)> {
+    const MAX: usize = 512;
+    let fd = File::open(file).await?;
+    let mut pos = 0;
+    loop {
+        let len = buf.len();
+        if len - pos < SZ && len < MAX {
+            buf.resize(len * 2, 0);
+        }
+        let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
+        let read = read?;
+        if read == 0 {
+            buf = res.into_inner();
+            break Ok((pos, buf));
+        } else {
+            buf = res.into_inner();
+            pos += read;
+            if pos >= MAX {
+                break Ok((pos, buf)); // we've read as much as we can
+            }
+        }
+    }
+}
 
 pub(crate) async fn poll_file(
     file: PathBuf,
@@ -27,7 +56,8 @@ pub(crate) async fn poll_file(
     mut clock: broadcast::Receiver<()>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
-    const SZ: usize = 64;
+    const MAX_SKIP: usize = 300;
+    let mut prev = vec![0; SZ];
     let mut buf = vec![0; SZ];
     let mut first = Some(first);
     let mut send = |v: Value| -> Result<()> {
@@ -39,40 +69,41 @@ pub(crate) async fn poll_file(
             }
         }
     };
-    loop {
-        let pos = {
-            let fd = File::open(&file).await?;
-            let mut pos = 0;
-            loop {
-                let len = buf.len();
-                if len - pos < SZ {
-                    buf.resize(len * 2, 0);
-                }
-                let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
-                let read = read?;
-                if read == 0 {
-                    buf = res.into_inner();
-                    break pos;
-                } else {
-                    buf = res.into_inner();
-                    pos += read;
-                }
+    let mut skip = 0;
+    'main: loop {
+        let (pos, buf_) = read_file(&file, buf).await?;
+        buf = buf_;
+        if prev.len() >= pos && &buf[0..pos] == &prev[0..pos] {
+            // backoff polling up to max_skip clocks if we find the
+            // file's contents unchanged
+            skip = max(MAX_SKIP, skip + 1);
+        } else {
+            if prev.len() != buf.len() {
+                prev.resize(buf.len(), 0);
             }
-        };
-        match std::str::from_utf8(&buf[0..pos]) {
-            Err(_) => send(Value::from(Bytes::copy_from_slice(&buf[0..pos])))?,
-            Ok(data) => match data.trim().parse::<i64>() {
-                Ok(i) => send(Value::from(i))?,
-                Err(_) => match data.trim().parse::<f64>() {
-                    Ok(f) => send(Value::from(f))?,
-                    Err(_) => send(Value::from(String::from(data.trim())))?,
+            prev.copy_from_slice(&buf);
+            match std::str::from_utf8(&buf[0..pos]) {
+                Err(_) => send(Value::from(Bytes::copy_from_slice(&buf[0..pos])))?,
+                Ok(data) => match data.trim().parse::<i64>() {
+                    Ok(i) => send(Value::from(i))?,
+                    Err(_) => match data.trim().parse::<f64>() {
+                        Ok(f) => send(Value::from(f))?,
+                        Err(_) => send(Value::from(String::from(data.trim())))?,
+                    },
                 },
             }
         }
-        select_biased! {
-            _ = stop => break Ok(()),
-            r = clock.recv().fuse() => if let Err(_) = r {
-                break Ok(());
+        let mut skipped = 0;
+        loop {
+            select_biased! {
+                _ = stop => break 'main Ok(()),
+                r = clock.recv().fuse() => if let Err(_) = r {
+                    break 'main Ok(());
+                }
+            }
+            skipped += 1;
+            if skipped >= skip {
+                break;
             }
         }
     }
@@ -160,7 +191,7 @@ impl Poller {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum FType {
     File,
     Directory,
@@ -170,17 +201,17 @@ pub(crate) struct Files {
     pub(crate) paths: BTreeMap<PathBuf, FType>,
     pub(crate) symlinks: BTreeMap<PathBuf, PathBuf>,
     pub(crate) base: PathBuf,
+    pub(crate) netidx_base: NPath,
 }
 
 impl Files {
-    pub(crate) fn new(base: PathBuf) -> Result<Self> {
-        let mut t = Self {
+    pub(crate) fn new(base: PathBuf, netidx_base: NPath) -> Self {
+        Self {
             paths: BTreeMap::default(),
             symlinks: BTreeMap::default(),
             base: base.clone(),
-        };
-        t.walk(base)?;
-        Ok(t)
+            netidx_base,
+        }
     }
 
     fn resolve_<'a, 'b: 'a>(
@@ -210,28 +241,74 @@ impl Files {
         self.resolve_(target, 0)
     }
 
-    pub(crate) fn netidx_path<P: AsRef<std::path::Path>>(&self, base: &NPath, path: P) -> NPath {
-        let path = match path.as_ref().strip_prefix(&self.base) {
-            Ok(p) => p,
-            Err(_) => path.as_ref(),
-        };
-        base.append(&path.as_os_str().to_string_lossy())
+    pub(crate) fn netidx_path<P: AsRef<std::path::Path>>(&self, path: P) -> Option<NPath> {
+        let path = path.as_ref().strip_prefix(&self.base).ok()?;
+        Some(self.netidx_base.append(&path.as_os_str().to_string_lossy()))
     }
 
-    fn walk(&mut self, path: PathBuf) -> Result<()> {
+    pub(crate) fn fs_path(&self, path: &NPath) -> Option<PathBuf> {
+        let path = NPath::strip_prefix(&self.netidx_base, path)?;
+        Some(self.base.join(PathBuf::from(path)))
+    }
+
+    fn children<T>(tree: &BTreeMap<PathBuf, T>, base: &PathBuf) -> Vec<PathBuf> {
+        use std::path::Path;
+        tree
+            .range::<Path, (Bound<&Path>, Bound<&Path>)>((Bound::Included(base), Bound::Unbounded))
+            .take_while(|(p, _)| p.starts_with(base))
+            .map(|(p, _)| p.clone())
+            .collect::<Vec<_>>()
+    }
+    
+    pub(crate) fn remove_children(&mut self, base: &PathBuf) {
+        for path in Self::children(&self.paths, base) {
+            self.paths.remove(&path);
+        }
+        for path in Self::children(&self.symlinks, base) {
+            self.symlinks.remove(&path);
+        }
+    }
+
+    pub(crate) fn walk(&mut self, path: PathBuf, max_depth: usize) {
+        self.walk_(path, max_depth, 0)
+    }
+
+    fn walk_(&mut self, path: PathBuf, max_depth: usize, depth: usize) {
+        const S_IFMT: u32 = 61440;
+        const S_IFREG: u32 = 32768;
+        if depth >= max_depth {
+            return;
+        }
+        macro_rules! log {
+            ($path:expr, $msg:expr, $e:expr) => {
+                match $e {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!($msg, $path, e);
+                        return;
+                    }
+                }
+            };
+        }
         use std::fs;
-        let st = fs::symlink_metadata(&path)?;
-        if st.is_symlink() {
-            let target = fs::canonicalize(&path)?;
-            self.symlinks.insert(path, target);
+        let st = log!(&path, "stat {:?}, {}", fs::symlink_metadata(&path));
+        if st.len() > 1048576 {
+            warn!("skipping file {:?} too large {}", &path, st.len())
+        } else if st.is_symlink() {
+            let target = log!(&path, "canonicalize {:?}, {}", fs::canonicalize(&path));
+            if target.starts_with(&self.base) {
+                self.symlinks.insert(path, target);
+            }
         } else if st.is_dir() {
-            for ent in fs::read_dir(&path)? {
-                self.walk(ent?.path())?
+            for ent in log!(&path, "readdir {:?}, {}", fs::read_dir(&path)) {
+                let ent = log!(&path, "reading dir ent in {:?}, {}", ent);
+                self.walk_(ent.path(), max_depth, depth + 1)
             }
             self.paths.insert(path, FType::Directory);
         } else if st.is_file() {
-            self.paths.insert(path, FType::File);
+            if st.st_mode() & S_IFMT == S_IFREG {
+                self.paths.insert(path, FType::File);
+            }
         }
-        Ok(())
     }
 }
