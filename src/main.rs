@@ -1,4 +1,5 @@
-#[macro_use] extern crate serde_derive;
+#[macro_use]
+extern crate serde_derive;
 
 //mod config;
 mod sysfs;
@@ -13,7 +14,13 @@ use netidx::{
     utils::{BatchItem, Batched},
 };
 use netidx_tools::ClientParams;
-use std::{collections::HashMap, mem, ops::Bound, path::PathBuf, time::{Instant, Duration}};
+use std::{
+    collections::{BTreeMap, HashMap},
+    mem,
+    ops::Bound,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use structopt::StructOpt;
 use tokio;
 
@@ -42,12 +49,27 @@ struct Params {
 struct Published {
     published: FxHashMap<Id, (Path, Val)>,
     by_fid: FxHashMap<Fid, Id>,
-    advertised: HashMap<Path, (PathBuf, Option<Id>)>,
-    aliased: HashMap<Path, Path>,
+    advertised: BTreeMap<Path, (PathBuf, Option<Id>)>,
+    aliased: BTreeMap<Path, Path>,
+    parents: BTreeMap<Path, (Instant, Files)>,
+    netidx_base: Path,
+    fs_base: PathBuf,
 }
 
 impl Published {
-    fn resolve(&mut self, path: &Path) -> Option<&mut (PathBuf, Option<Id>)> {
+    fn new(netidx_base: Path, fs_base: PathBuf) -> Self {
+        Self {
+            published: HashMap::default(),
+            by_fid: HashMap::default(),
+            advertised: BTreeMap::default(),
+            aliased: BTreeMap::default(),
+            parents: BTreeMap::new(),
+            netidx_base,
+            fs_base
+        }
+    }
+
+    async fn resolve(&mut self, path: &Path) -> Option<&mut (PathBuf, Option<Id>)> {
         let tgt = self.aliased.get(path).cloned();
         match tgt {
             Some(tgt) => self.resolve(&tgt),
@@ -55,13 +77,7 @@ impl Published {
         }
     }
 
-    fn advertise(base: &Path, files: &Files, dp: &DefaultHandle) -> Self {
-        let mut t = Published {
-            published: HashMap::default(),
-            by_fid: HashMap::default(),
-            advertised: HashMap::default(),
-            aliased: HashMap::default(),
-        };
+    fn advertise(&mut self, dp: &DefaultHandle, ) -> Self {
         for (path, typ) in &files.paths {
             match typ {
                 FType::Directory => (),
@@ -142,7 +158,7 @@ async fn main() -> Result<()> {
     let (cfg, auth) = opts.common.load();
     let timeout = opts.timeout.map(Duration::from_secs);
     let st = Instant::now();
-    let files = sysfs::Files::new(opts.sysfs);
+    let files = sysfs::Files::new(opts.sysfs, opts.base.clone());
     dbg!(st.elapsed());
     let publisher = Publisher::new(cfg, auth, opts.bind).await?;
     let (tx_updates, rx_updates) = mpsc::unbounded();

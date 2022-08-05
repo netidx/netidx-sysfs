@@ -276,7 +276,7 @@ impl Files {
     fn walk_(&mut self, path: PathBuf, max_depth: usize, depth: usize) {
         const S_IFMT: u32 = 61440;
         const S_IFREG: u32 = 32768;
-        if depth >= max_depth {
+        if depth > max_depth {
             return;
         }
         macro_rules! log {
