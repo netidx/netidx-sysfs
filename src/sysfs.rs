@@ -9,18 +9,125 @@ use futures::{
     select_biased,
 };
 use fxhash::FxHashMap;
+use immutable_chunkmap::map::Map as CMap;
 use log::{error, warn};
-use netidx::{path::Path as NPath, publisher::Value};
+use netidx::publisher::Value;
 use std::{
-    cmp::max,
-    collections::{BTreeMap, HashMap},
-    ops::Bound,
-    os::linux::fs::MetadataExt,
-    path::PathBuf,
+    cmp::max, collections::HashMap, ops::Bound, os::linux::fs::MetadataExt, path::PathBuf,
     time::Duration,
 };
 use tokio::{sync::broadcast, time};
 use tokio_uring::{self, buf::IoBuf, fs::File};
+use triomphe::Arc;
+
+pub(crate) type Map<K, V> = CMap<K, V, 64>;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FType {
+    File,
+    Directory,
+}
+
+#[derive(Clone)]
+pub(crate) struct Files {
+    paths: Map<Arc<PathBuf>, FType>,
+    symlinks: Map<Arc<PathBuf>, Arc<PathBuf>>,
+}
+
+impl Files {
+    pub(crate) fn new(path: Arc<PathBuf>, max_depth: usize) -> Self {
+        Self {
+            paths: Map::default(),
+            symlinks: Map::default(),
+        }
+        .walk(path, max_depth)
+    }
+
+    fn resolve_<'a, 'b: 'a>(
+        &'a self,
+        target: &'b PathBuf,
+        cycle: usize,
+    ) -> Result<(&'a PathBuf, FType)> {
+        match self.symlinks.get(target) {
+            Some(target) => {
+                let cycle = cycle + 1;
+                if cycle > 256 {
+                    bail!("too many levels of symbolic links")
+                }
+                self.resolve_(target, cycle)
+            }
+            None => match self.paths.get(target) {
+                None => bail!("broken link"),
+                Some(ft) => Ok((target, *ft)),
+            },
+        }
+    }
+
+    pub(crate) fn resolve<'a, 'b: 'a>(
+        &'a self,
+        target: &'b PathBuf,
+    ) -> Result<(&'a PathBuf, FType)> {
+        self.resolve_(target, 0)
+    }
+
+    pub(crate) fn walk(&self, path: Arc<PathBuf>, max_depth: usize) -> Self {
+        self.walk_(path, max_depth, 0)
+    }
+
+    fn walk_(&self, path: Arc<PathBuf>, max_depth: usize, depth: usize) -> Self {
+        const S_IFMT: u32 = 61440;
+        const S_IFREG: u32 = 32768;
+        macro_rules! log {
+            ($map:expr, $path:expr, $msg:expr, $e:expr) => {
+                match $e {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!($msg, $path, e);
+                        return $map.clone();
+                    }
+                }
+            };
+        }
+        use std::fs;
+        let st = log!(self, &path, "stat {:?}, {}", fs::symlink_metadata(&*path));
+        if st.is_symlink() {
+            let target = log!(
+                self,
+                &path,
+                "canonicalize {:?}, {}",
+                fs::canonicalize(&*path)
+            );
+            let target = Arc::new(target);
+            let symlinks = self.symlinks.insert(path, target).0;
+            Self {
+                symlinks,
+                ..self.clone()
+            }
+        } else if st.is_dir() {
+            let mut t = self.clone();
+            if depth < max_depth {
+                for ent in log!(self, &path, "readdir {:?}, {}", fs::read_dir(&*path)) {
+                    let ent = log!(self, &path, "reading dir ent in {:?}, {}", ent);
+                    t = t.walk_(Arc::new(ent.path()), max_depth, depth + 1);
+                }
+            }
+            let paths = t.paths.insert(path, FType::Directory).0;
+            Self { paths, ..t }
+        } else if st.is_file() {
+            if st.st_mode() & S_IFMT == S_IFREG {
+                let paths = self.paths.insert(path, FType::File).0;
+                Self {
+                    paths,
+                    ..self.clone()
+                }
+            } else {
+                self.clone()
+            }
+        } else {
+            self.clone()
+        }
+    }
+}
 
 const SZ: usize = 64;
 
@@ -109,6 +216,30 @@ pub(crate) async fn poll_file(
     }
 }
 
+pub(crate) enum StructureItem {
+    File,
+    Directory,
+    Symlink(Arc<PathBuf>),
+}
+
+pub(crate) enum StructureAction {
+    Added,
+    Removed,
+}
+
+pub(crate) struct StructureUpdate {
+    path: Arc<PathBuf>,
+    action: StructureAction,
+    item: StructureItem,
+}
+
+async fn poll_structure(
+    path: PathBuf,
+    id: Fid,
+    mut updates: mpsc::UnboundedSender<(Fid, Vec<StructureUpdate>)>,
+) {
+}
+
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(crate) struct Fid(u64);
 
@@ -123,13 +254,15 @@ impl Fid {
 enum FileReq {
     StartPolling(Fid, PathBuf, oneshot::Sender<Value>),
     StopPolling(Fid),
+    StartPollingStructure(Fid, PathBuf),
 }
 
 pub(crate) struct Poller(UnboundedSender<FileReq>);
 
 impl Poller {
     async fn run(
-        updates: mpsc::UnboundedSender<(Fid, Value)>,
+        file_updates: mpsc::UnboundedSender<(Fid, Value)>,
+        structure_updates: mpsc::UnboundedSender<(Fid, Vec<StructureUpdate>)>,
         mut req: mpsc::UnboundedReceiver<FileReq>,
     ) -> Result<()> {
         let (clock, _) = broadcast::channel(3);
@@ -159,11 +292,14 @@ impl Poller {
         }
     }
 
-    pub(crate) fn new(updates: mpsc::UnboundedSender<(Fid, Value)>) -> Self {
+    pub(crate) fn new(
+        file_updates: mpsc::UnboundedSender<(Fid, Value)>,
+        structure_updates: mpsc::UnboundedSender<(Fid, Vec<StructureUpdate>)>,
+    ) -> Self {
         let (tx_req, rx_req) = mpsc::unbounded();
         std::thread::spawn(move || {
             tokio_uring::start(async move {
-                if let Err(e) = Self::run(updates, rx_req).await {
+                if let Err(e) = Self::run(file_updates, structure_updates, rx_req).await {
                     error!("file poller failed {}", e)
                 }
             })
@@ -191,58 +327,9 @@ impl Poller {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum FType {
-    File,
-    Directory,
-}
-
-pub(crate) struct Files {
-    pub(crate) paths: BTreeMap<PathBuf, FType>,
-    pub(crate) symlinks: BTreeMap<PathBuf, PathBuf>,
-    pub(crate) base: PathBuf,
-    pub(crate) netidx_base: NPath,
-}
-
-impl Files {
-    pub(crate) fn new(base: PathBuf, netidx_base: NPath) -> Self {
-        Self {
-            paths: BTreeMap::default(),
-            symlinks: BTreeMap::default(),
-            base: base.clone(),
-            netidx_base,
-        }
-    }
-
-    fn resolve_<'a, 'b: 'a>(
-        &'a self,
-        target: &'b PathBuf,
-        cycle: usize,
-    ) -> Result<(&'a PathBuf, FType)> {
-        match self.symlinks.get(target) {
-            Some(target) => {
-                let cycle = cycle + 1;
-                if cycle > 256 {
-                    bail!("too many levels of symbolic links")
-                }
-                self.resolve_(target, cycle)
-            }
-            None => match self.paths.get(target) {
-                None => bail!("broken link"),
-                Some(ft) => Ok((target, *ft)),
-            },
-        }
-    }
-
-    pub(crate) fn resolve<'a, 'b: 'a>(
-        &'a self,
-        target: &'b PathBuf,
-    ) -> Result<(&'a PathBuf, FType)> {
-        self.resolve_(target, 0)
-    }
-
+/*
     pub(crate) fn netidx_path<P: AsRef<std::path::Path>>(&self, path: P) -> Option<NPath> {
-        let path = path.as_ref().strip_prefix(&self.base).ok()?;
+        let path = path.as_ref().strip_prefix(&*self.base).ok()?;
         Some(self.netidx_base.append(&path.as_os_str().to_string_lossy()))
     }
 
@@ -251,64 +338,4 @@ impl Files {
         Some(self.base.join(PathBuf::from(path)))
     }
 
-    fn children<T>(tree: &BTreeMap<PathBuf, T>, base: &PathBuf) -> Vec<PathBuf> {
-        use std::path::Path;
-        tree
-            .range::<Path, (Bound<&Path>, Bound<&Path>)>((Bound::Included(base), Bound::Unbounded))
-            .take_while(|(p, _)| p.starts_with(base))
-            .map(|(p, _)| p.clone())
-            .collect::<Vec<_>>()
-    }
-    
-    pub(crate) fn remove_children(&mut self, base: &PathBuf) {
-        for path in Self::children(&self.paths, base) {
-            self.paths.remove(&path);
-        }
-        for path in Self::children(&self.symlinks, base) {
-            self.symlinks.remove(&path);
-        }
-    }
-
-    pub(crate) fn walk(&mut self, path: PathBuf, max_depth: usize) {
-        self.walk_(path, max_depth, 0)
-    }
-
-    fn walk_(&mut self, path: PathBuf, max_depth: usize, depth: usize) {
-        const S_IFMT: u32 = 61440;
-        const S_IFREG: u32 = 32768;
-        if depth > max_depth {
-            return;
-        }
-        macro_rules! log {
-            ($path:expr, $msg:expr, $e:expr) => {
-                match $e {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!($msg, $path, e);
-                        return;
-                    }
-                }
-            };
-        }
-        use std::fs;
-        let st = log!(&path, "stat {:?}, {}", fs::symlink_metadata(&path));
-        if st.len() > 1048576 {
-            warn!("skipping file {:?} too large {}", &path, st.len())
-        } else if st.is_symlink() {
-            let target = log!(&path, "canonicalize {:?}, {}", fs::canonicalize(&path));
-            if target.starts_with(&self.base) {
-                self.symlinks.insert(path, target);
-            }
-        } else if st.is_dir() {
-            for ent in log!(&path, "readdir {:?}, {}", fs::read_dir(&path)) {
-                let ent = log!(&path, "reading dir ent in {:?}, {}", ent);
-                self.walk_(ent.path(), max_depth, depth + 1)
-            }
-            self.paths.insert(path, FType::Directory);
-        } else if st.is_file() {
-            if st.st_mode() & S_IFMT == S_IFREG {
-                self.paths.insert(path, FType::File);
-            }
-        }
-    }
-}
+*/
