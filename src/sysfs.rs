@@ -463,8 +463,9 @@ impl StructurePoller {
     }
 
     pub(crate) fn stop(&self, id: Fid) -> Result<()> {
-        if let Err(_) = self.0.unounded_send(StructureReq::StopPolling(id)) {
+        if let Err(_) = self.0.unbounded_send(StructureReq::StopPolling(id)) {
             bail!("structure poller is dead")
         }
+        Ok(())
     }
 }
