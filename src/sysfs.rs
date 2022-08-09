@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use futures::{
     channel::{
-        mpsc::{self, UnboundedSender},
+        mpsc::{self, UnboundedSender, UnboundedReceiver},
         oneshot,
     },
     prelude::*,
@@ -310,12 +310,12 @@ pub(crate) async fn poll_file(
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub(crate) struct Fid(u64);
+pub(crate) struct Fid(u32);
 
 impl Fid {
     fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
         Fid(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 }
@@ -329,8 +329,8 @@ pub(crate) struct FilePoller(UnboundedSender<FileReq>);
 
 impl FilePoller {
     async fn run(
-        updates: mpsc::UnboundedSender<(Fid, Value)>,
-        mut req: mpsc::UnboundedReceiver<FileReq>,
+        updates: UnboundedSender<(Fid, Value)>,
+        mut req: UnboundedReceiver<FileReq>,
     ) -> Result<()> {
         let (clock, _) = broadcast::channel(3);
         let mut polling: FxHashMap<Fid, oneshot::Sender<()>> = HashMap::default();
@@ -359,7 +359,7 @@ impl FilePoller {
         }
     }
 
-    pub(crate) fn new(updates: mpsc::UnboundedSender<(Fid, Value)>) -> Self {
+    pub(crate) fn new(updates: UnboundedSender<(Fid, Value)>) -> Self {
         let (tx_req, rx_req) = mpsc::unbounded();
         std::thread::spawn(move || {
             tokio_uring::start(async move {
@@ -394,7 +394,7 @@ impl FilePoller {
 async fn poll_structure(
     path: PathBuf,
     id: Fid,
-    mut updates: mpsc::UnboundedSender<StructureUpdate>,
+    mut updates: UnboundedSender<StructureUpdate>,
     first: oneshot::Sender<Files>,
     mut stop: oneshot::Receiver<()>,
 ) {
@@ -428,3 +428,43 @@ enum StructureReq {
 }
 
 pub(crate) struct StructurePoller(UnboundedSender<StructureReq>);
+
+impl StructurePoller {
+    async fn run(updates: UnboundedSender<StructureUpdate>, mut req: UnboundedReceiver<StructureReq>) {
+        let mut polling: FxHashMap<Fid, oneshot::Sender<()>> = HashMap::default();
+        while let Some(r) = req.next().await {
+            match r {
+                StructureReq::StopPolling(id) => { polling.remove(&id); }
+                StructureReq::StartPolling(id, path, initial) => {
+                    let (tx_stop, rx_stop) = oneshot::channel();
+                    task::spawn(poll_structure(path, id, updates.clone(), initial, rx_stop));
+                    polling.insert(id, tx_stop);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn new(updates: UnboundedSender<StructureUpdate>) -> Self {
+        let (tx_req, rx_req) = mpsc::unbounded();
+        task::spawn(Self::run(updates, rx_req));
+        Self(tx_req)
+    }
+
+    pub(crate) async fn start(&self, path: PathBuf) -> Result<(Fid, Files)> {
+        let (tx_init, rx_init) = oneshot::channel();
+        let id = Fid::new();
+        if let Err(_) = self.0.unbounded_send(StructureReq::StartPolling(id, path, tx_init)) {
+            bail!("structure poller is dead")
+        }
+        match rx_init.await {
+            Err(_) => bail!("failed to get initial value"),
+            Ok(f) => Ok((id, f))
+        }
+    }
+
+    pub(crate) fn stop(&self, id: Fid) -> Result<()> {
+        if let Err(_) = self.0.unounded_send(StructureReq::StopPolling(id)) {
+            bail!("structure poller is dead")
+        }
+    }
+}
