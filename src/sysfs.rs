@@ -11,16 +11,69 @@ use futures::{
 use fxhash::FxHashMap;
 use immutable_chunkmap::map::Map as CMap;
 use log::{error, warn};
-use netidx::publisher::Value;
+use netidx::{path::Path as NPath, publisher::Value};
 use std::{
     cmp::max, collections::HashMap, ops::Bound, os::linux::fs::MetadataExt, path::PathBuf,
     time::Duration,
 };
-use tokio::{sync::broadcast, time};
+use tokio::{sync::broadcast, task, time};
 use tokio_uring::{self, buf::IoBuf, fs::File};
 use triomphe::Arc;
 
 pub(crate) type Map<K, V> = CMap<K, V, 64>;
+
+pub(crate) struct Paths {
+    base: PathBuf,
+    netidx_base: NPath,
+}
+
+impl Paths {
+    pub(crate) fn new(base: PathBuf, netidx_base: NPath) -> Self {
+        Self { base, netidx_base }
+    }
+
+    pub(crate) fn netidx_path<P: AsRef<std::path::Path>>(&self, path: P) -> Option<NPath> {
+        let path = path.as_ref().strip_prefix(&*self.base).ok()?;
+        Some(self.netidx_base.append(&path.as_os_str().to_string_lossy()))
+    }
+
+    pub(crate) fn fs_path(&self, path: &NPath) -> Option<PathBuf> {
+        let path = NPath::strip_prefix(&self.netidx_base, path)?;
+        Some(self.base.join(PathBuf::from(path)))
+    }
+}
+
+pub(crate) enum StructureItem {
+    File,
+    Directory,
+    Symlink { target: Arc<PathBuf> },
+}
+
+impl StructureItem {
+    fn from_ftype(ft: &FType) -> Self {
+        match ft {
+            FType::File => Self::File,
+            FType::Directory => Self::Directory,
+        }
+    }
+}
+
+pub(crate) enum StructureAction {
+    Added,
+    Removed,
+}
+
+pub(crate) struct StructureItemUpdate {
+    path: Arc<PathBuf>,
+    action: StructureAction,
+    item: StructureItem,
+}
+
+pub(crate) struct StructureUpdate {
+    id: Fid,
+    files: Files,
+    changes: Vec<StructureItemUpdate>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FType {
@@ -35,12 +88,11 @@ pub(crate) struct Files {
 }
 
 impl Files {
-    pub(crate) fn new(path: Arc<PathBuf>, max_depth: usize) -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             paths: Map::default(),
             symlinks: Map::default(),
         }
-        .walk(path, max_depth)
     }
 
     fn resolve_<'a, 'b: 'a>(
@@ -68,6 +120,47 @@ impl Files {
         target: &'b PathBuf,
     ) -> Result<(&'a PathBuf, FType)> {
         self.resolve_(target, 0)
+    }
+
+    pub(crate) fn diff(&self, other: &Self) -> Vec<StructureItemUpdate> {
+        let mut changes: Vec<StructureItemUpdate> = Vec::new();
+        let removed = self.paths.diff(&other.paths, |_, _, _| None);
+        let added = other.paths.diff(&self.paths, |_, _, _| None);
+        let removed_links = self.symlinks.diff(&other.symlinks, |_, _, _| None);
+        let added_links = other.symlinks.diff(&self.symlinks, |_, _, _| None);
+        for (path, ftype) in &removed {
+            changes.push(StructureItemUpdate {
+                path: path.clone(),
+                action: StructureAction::Removed,
+                item: StructureItem::from_ftype(ftype),
+            });
+        }
+        for (path, ftype) in &added {
+            changes.push(StructureItemUpdate {
+                path: path.clone(),
+                action: StructureAction::Added,
+                item: StructureItem::from_ftype(ftype),
+            })
+        }
+        for (path, target) in &added_links {
+            changes.push(StructureItemUpdate {
+                path: path.clone(),
+                action: StructureAction::Added,
+                item: StructureItem::Symlink {
+                    target: target.clone(),
+                },
+            })
+        }
+        for (path, target) in &removed_links {
+            changes.push(StructureItemUpdate {
+                path: path.clone(),
+                action: StructureAction::Removed,
+                item: StructureItem::Symlink {
+                    target: target.clone(),
+                },
+            })
+        }
+        changes
     }
 
     pub(crate) fn walk(&self, path: Arc<PathBuf>, max_depth: usize) -> Self {
@@ -216,30 +309,6 @@ pub(crate) async fn poll_file(
     }
 }
 
-pub(crate) enum StructureItem {
-    File,
-    Directory,
-    Symlink(Arc<PathBuf>),
-}
-
-pub(crate) enum StructureAction {
-    Added,
-    Removed,
-}
-
-pub(crate) struct StructureUpdate {
-    path: Arc<PathBuf>,
-    action: StructureAction,
-    item: StructureItem,
-}
-
-async fn poll_structure(
-    path: PathBuf,
-    id: Fid,
-    mut updates: mpsc::UnboundedSender<(Fid, Vec<StructureUpdate>)>,
-) {
-}
-
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(crate) struct Fid(u64);
 
@@ -254,15 +323,13 @@ impl Fid {
 enum FileReq {
     StartPolling(Fid, PathBuf, oneshot::Sender<Value>),
     StopPolling(Fid),
-    StartPollingStructure(Fid, PathBuf),
 }
 
-pub(crate) struct Poller(UnboundedSender<FileReq>);
+pub(crate) struct FilePoller(UnboundedSender<FileReq>);
 
-impl Poller {
+impl FilePoller {
     async fn run(
-        file_updates: mpsc::UnboundedSender<(Fid, Value)>,
-        structure_updates: mpsc::UnboundedSender<(Fid, Vec<StructureUpdate>)>,
+        updates: mpsc::UnboundedSender<(Fid, Value)>,
         mut req: mpsc::UnboundedReceiver<FileReq>,
     ) -> Result<()> {
         let (clock, _) = broadcast::channel(3);
@@ -292,14 +359,11 @@ impl Poller {
         }
     }
 
-    pub(crate) fn new(
-        file_updates: mpsc::UnboundedSender<(Fid, Value)>,
-        structure_updates: mpsc::UnboundedSender<(Fid, Vec<StructureUpdate>)>,
-    ) -> Self {
+    pub(crate) fn new(updates: mpsc::UnboundedSender<(Fid, Value)>) -> Self {
         let (tx_req, rx_req) = mpsc::unbounded();
         std::thread::spawn(move || {
             tokio_uring::start(async move {
-                if let Err(e) = Self::run(file_updates, structure_updates, rx_req).await {
+                if let Err(e) = Self::run(updates, rx_req).await {
                     error!("file poller failed {}", e)
                 }
             })
@@ -327,15 +391,40 @@ impl Poller {
     }
 }
 
-/*
-    pub(crate) fn netidx_path<P: AsRef<std::path::Path>>(&self, path: P) -> Option<NPath> {
-        let path = path.as_ref().strip_prefix(&*self.base).ok()?;
-        Some(self.netidx_base.append(&path.as_os_str().to_string_lossy()))
+async fn poll_structure(
+    path: PathBuf,
+    id: Fid,
+    mut updates: mpsc::UnboundedSender<StructureUpdate>,
+    first: oneshot::Sender<Files>,
+    mut stop: oneshot::Receiver<()>,
+) {
+    let path = Arc::new(path);
+    let mut files = task::block_in_place(|| Files::empty().walk(path.clone(), 2));
+    let _ = first.send(files.clone());
+    let mut clock = time::interval(Duration::from_secs(1));
+    loop {
+        select_biased! {
+            _ = clock.tick().fuse() => {
+                let files_ = task::block_in_place(|| Files::walk(&files, path.clone(), 2));
+                let changes = files.diff(&files_);
+                files = files_;
+                let r = updates.unbounded_send(StructureUpdate {
+                    id,
+                    files: files.clone(),
+                    changes
+                });
+                if let Err(_) = r {
+                    break
+                }
+            }
+            _ = stop => break,
+        }
     }
+}
 
-    pub(crate) fn fs_path(&self, path: &NPath) -> Option<PathBuf> {
-        let path = NPath::strip_prefix(&self.netidx_base, path)?;
-        Some(self.base.join(PathBuf::from(path)))
-    }
+enum StructureReq {
+    StartPolling(Fid, PathBuf, oneshot::Sender<Files>),
+    StopPolling(Fid)
+}
 
-*/
+pub(crate) struct StructurePoller(UnboundedSender<StructureReq>);
