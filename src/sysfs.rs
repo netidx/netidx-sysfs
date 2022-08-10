@@ -2,18 +2,22 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use futures::{
     channel::{
-        mpsc::{self, UnboundedSender, UnboundedReceiver},
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
     prelude::*,
     select_biased,
 };
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use immutable_chunkmap::map::Map as CMap;
 use log::{error, warn};
 use netidx::{path::Path as NPath, publisher::Value};
 use std::{
-    cmp::max, collections::HashMap, ops::Bound, os::linux::fs::MetadataExt, path::PathBuf,
+    cmp::max,
+    collections::{HashMap, HashSet},
+    ops::Bound,
+    os::linux::fs::MetadataExt,
+    path::PathBuf,
     time::Duration,
 };
 use tokio::{sync::broadcast, task, time};
@@ -392,15 +396,14 @@ impl FilePoller {
 }
 
 async fn poll_structure(
-    path: PathBuf,
+    path: Arc<PathBuf>,
     id: Fid,
     mut updates: UnboundedSender<StructureUpdate>,
-    first: oneshot::Sender<Files>,
+    first: oneshot::Sender<Option<Files>>,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let path = Arc::new(path);
     let mut files = task::block_in_place(|| Files::empty().walk(path.clone(), 2));
-    let _ = first.send(files.clone());
+    let _ = first.send(Some(files.clone()));
     let mut clock = time::interval(Duration::from_secs(1));
     loop {
         select_biased! {
@@ -423,46 +426,62 @@ async fn poll_structure(
 }
 
 enum StructureReq {
-    StartPolling(Fid, PathBuf, oneshot::Sender<Files>),
-    StopPolling(Fid)
+    StartPolling(Fid, Arc<PathBuf>, oneshot::Sender<Option<Files>>),
+    StopPolling(Fid),
 }
 
 pub(crate) struct StructurePoller(UnboundedSender<StructureReq>);
 
 impl StructurePoller {
-    async fn run(updates: UnboundedSender<StructureUpdate>, mut req: UnboundedReceiver<StructureReq>) {
-        let mut polling: FxHashMap<Fid, oneshot::Sender<()>> = HashMap::default();
+    async fn run(
+        updates: UnboundedSender<StructureUpdate>,
+        mut req: UnboundedReceiver<StructureReq>,
+    ) {
+        let mut by_path: FxHashMap<Arc<PathBuf>, Fid> = HashMap::default();
+        let mut by_id: FxHashMap<Fid, (Arc<PathBuf>, oneshot::Sender<()>)> = HashMap::default();
         while let Some(r) = req.next().await {
             match r {
-                StructureReq::StopPolling(id) => { polling.remove(&id); }
+                StructureReq::StopPolling(id) => {
+                    if let Some((path, _)) = by_id.remove(&id) {
+                        by_path.remove(&path);
+                    }
+                }
                 StructureReq::StartPolling(id, path, initial) => {
-                    let (tx_stop, rx_stop) = oneshot::channel();
-                    task::spawn(poll_structure(path, id, updates.clone(), initial, rx_stop));
-                    polling.insert(id, tx_stop);
+                    if !by_path.contains_key(&path) {
+                        by_path.insert(path.clone(), id);
+                        let (tx_stop, rx_stop) = oneshot::channel();
+                        task::spawn(poll_structure(path.clone(), id, updates.clone(), initial, rx_stop));
+                        by_id.insert(id, (path, tx_stop));
+                    } else {
+                        let _ = initial.send(None);
+                    }
                 }
             }
         }
     }
 
     pub(crate) fn new(updates: UnboundedSender<StructureUpdate>) -> Self {
-        let (tx_req, rx_req) = mpsc::unbounded();
-        task::spawn(Self::run(updates, rx_req));
-        Self(tx_req)
+        let (tx, rx) = mpsc::unbounded();
+        task::spawn(Self::run(updates, rx));
+        Self(tx)
     }
 
-    pub(crate) async fn start(&self, path: PathBuf) -> Result<(Fid, Files)> {
+    pub(crate) async fn start(&mut self, path: PathBuf) -> Result<Option<(Fid, Files)>> {
         let (tx_init, rx_init) = oneshot::channel();
         let id = Fid::new();
-        if let Err(_) = self.0.unbounded_send(StructureReq::StartPolling(id, path, tx_init)) {
+        if let Err(_) =
+            self.0
+                .unbounded_send(StructureReq::StartPolling(id, Arc::new(path), tx_init))
+        {
             bail!("structure poller is dead")
         }
         match rx_init.await {
             Err(_) => bail!("failed to get initial value"),
-            Ok(f) => Ok((id, f))
+            Ok(f) => Ok(f.map(|f| (id, f))),
         }
     }
 
-    pub(crate) fn stop(&self, id: Fid) -> Result<()> {
+    pub(crate) fn stop(&mut self, id: Fid) -> Result<()> {
         if let Err(_) = self.0.unbounded_send(StructureReq::StopPolling(id)) {
             bail!("structure poller is dead")
         }

@@ -3,7 +3,7 @@ extern crate serde_derive;
 
 //mod config;
 mod sysfs;
-use crate::sysfs::{FType, Fid, Files, Poller};
+use crate::sysfs::{FType, Fid, FilePoller, Files, StructurePoller, StructureUpdate};
 use anyhow::Result;
 use futures::{channel::mpsc, prelude::*, select_biased};
 use fxhash::FxHashMap;
@@ -65,7 +65,7 @@ impl Published {
             aliased: BTreeMap::default(),
             parents: BTreeMap::new(),
             netidx_base,
-            fs_base
+            fs_base,
         }
     }
 
@@ -77,7 +77,7 @@ impl Published {
         }
     }
 
-    fn advertise(&mut self, dp: &DefaultHandle, ) -> Self {
+    fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
         for (path, typ) in &files.paths {
             match typ {
                 FType::Directory => (),
@@ -158,16 +158,17 @@ async fn main() -> Result<()> {
     let (cfg, auth) = opts.common.load();
     let timeout = opts.timeout.map(Duration::from_secs);
     let st = Instant::now();
-    let files = sysfs::Files::new(opts.sysfs, opts.base.clone());
     dbg!(st.elapsed());
     let publisher = Publisher::new(cfg, auth, opts.bind).await?;
-    let (tx_updates, rx_updates) = mpsc::unbounded();
+    let (tx_file_updates, rx_file_updates) = mpsc::unbounded();
+    let (tx_structure_updates, rx_structure_updates) = mpsc::unbounded();
     let (tx_events, mut rx_events) = mpsc::unbounded();
     publisher.events(tx_events);
-    let mut rx_updates = Batched::new(rx_updates, 10_000);
-    let poller = Poller::new(tx_updates);
+    let mut rx_file_updates = Batched::new(rx_file_updates, 10_000);
+    let file_poller = FilePoller::new(tx_file_updates);
+    let structure_poller = StructurePoller::new(tx_structure_updates);
     let mut dp = publisher.publish_default(opts.base.clone())?;
-    let mut published = Published::advertise(&opts.base, &files, &dp);
+    let mut published = Published::new(opts.base.clone(), opts.sysfs.clone());
     let mut updates = publisher.start_batch();
     loop {
         select_biased! {
