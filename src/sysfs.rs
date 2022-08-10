@@ -13,7 +13,7 @@ use immutable_chunkmap::map::Map as CMap;
 use log::{error, warn};
 use netidx::{path::Path as NPath, publisher::Value};
 use std::{
-    cmp::max,
+    cmp::min,
     collections::{HashMap, HashSet},
     ops::Bound,
     os::linux::fs::MetadataExt,
@@ -260,7 +260,7 @@ pub(crate) async fn poll_file(
     mut clock: broadcast::Receiver<()>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
-    const MAX_SKIP: usize = 300;
+    const MAX_SKIP: u16 = 300;
     let mut prev = vec![0; SZ];
     let mut buf = vec![0; SZ];
     let mut first = Some(first);
@@ -273,15 +273,16 @@ pub(crate) async fn poll_file(
             }
         }
     };
-    let mut skip = 0;
+    let mut skip: u16 = 0;
     'main: loop {
         let (pos, buf_) = read_file(&file, buf).await?;
         buf = buf_;
         if prev.len() >= pos && &buf[0..pos] == &prev[0..pos] {
             // backoff polling up to max_skip clocks if we find the
             // file's contents unchanged
-            skip = max(MAX_SKIP, skip + 1);
+            skip = min(MAX_SKIP, skip + 1);
         } else {
+            skip >>= 1;
             if prev.len() != buf.len() {
                 prev.resize(buf.len(), 0);
             }
@@ -297,7 +298,7 @@ pub(crate) async fn poll_file(
                 },
             }
         }
-        let mut skipped = 0;
+        let mut skipped: u16 = 0;
         loop {
             select_biased! {
                 _ = stop => break 'main Ok(()),
@@ -402,22 +403,35 @@ async fn poll_structure(
     first: oneshot::Sender<Option<Files>>,
     mut stop: oneshot::Receiver<()>,
 ) {
+    const MAX_SKIP: u8 = 120;
     let mut files = task::block_in_place(|| Files::empty().walk(path.clone(), 2));
     let _ = first.send(Some(files.clone()));
     let mut clock = time::interval(Duration::from_secs(1));
+    let mut skip: u8 = 0;
+    let mut skipped: u8 = 0;
     loop {
         select_biased! {
             _ = clock.tick().fuse() => {
-                let files_ = task::block_in_place(|| Files::walk(&files, path.clone(), 2));
-                let changes = files.diff(&files_);
-                files = files_;
-                let r = updates.unbounded_send(StructureUpdate {
-                    id,
-                    files: files.clone(),
-                    changes
-                });
-                if let Err(_) = r {
-                    break
+                if skipped < skip {
+                    skipped += 1;
+                } else {
+                    skipped = 0;
+                    let files_ = task::block_in_place(|| Files::walk(&files, path.clone(), 2));
+                    let changes = files.diff(&files_);
+                    files = files_;
+                    if changes.len() == 0 {
+                        skip = min(MAX_SKIP, skip + 1);
+                    } else {
+                        skip >>= 1;
+                    }
+                    let r = updates.unbounded_send(StructureUpdate {
+                        id,
+                        files: files.clone(),
+                        changes
+                    });
+                    if let Err(_) = r {
+                        break
+                    }
                 }
             }
             _ = stop => break,
@@ -447,13 +461,13 @@ impl StructurePoller {
                     }
                 }
                 StructureReq::StartPolling(id, path, initial) => {
-                    if !by_path.contains_key(&path) {
+                    if by_path.contains_key(&path) {
+                        let _ = initial.send(None);
+                    } else {
                         by_path.insert(path.clone(), id);
                         let (tx_stop, rx_stop) = oneshot::channel();
-                        task::spawn(poll_structure(path.clone(), id, updates.clone(), initial, rx_stop));
-                        by_id.insert(id, (path, tx_stop));
-                    } else {
-                        let _ = initial.send(None);
+                        by_id.insert(id, (path.clone(), tx_stop));
+                        task::spawn(poll_structure(path, id, updates.clone(), initial, rx_stop));
                     }
                 }
             }
