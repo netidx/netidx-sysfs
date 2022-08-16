@@ -3,7 +3,7 @@ extern crate serde_derive;
 
 //mod config;
 mod sysfs;
-use crate::sysfs::{FType, Fid, FilePoller, Files, StructurePoller, StructureUpdate, Paths};
+use crate::sysfs::{FType, Fid, FilePoller, Files, Paths, StructurePoller, StructureUpdate};
 use anyhow::Result;
 use futures::{channel::mpsc, prelude::*, select_biased};
 use fxhash::FxHashMap;
@@ -21,9 +21,10 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-use triomphe::Arc;
 use structopt::StructOpt;
+use sysfs::{StructureAction, StructureItem};
 use tokio;
+use triomphe::Arc;
 
 #[derive(StructOpt, Debug)]
 struct Params {
@@ -47,8 +48,14 @@ struct Params {
     sysfs: PathBuf,
 }
 
+struct PublishedFile {
+    fid: Fid,
+    path: Path,
+    val: Val,
+}
+
 struct Published {
-    published: FxHashMap<Id, (Path, Val)>,
+    published: FxHashMap<Id, PublishedFile>,
     by_fid: FxHashMap<Fid, Id>,
     advertised: BTreeMap<Path, (Arc<PathBuf>, Option<Id>)>,
     aliased: BTreeMap<Path, Path>,
@@ -76,11 +83,56 @@ impl Published {
         }
     }
 
+    fn remove(&mut self, path: &Path) {
+        if let Some((_, Some(id))) = self.advertised.remove(&path) {
+            if let Some(pf) = self.published.remove(&id) {
+                self.by_fid.remove(&pf.fid);
+            }
+        }
+    }
+
     fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
+        fn children<T>(map: &BTreeMap<Path, T>, parent: &Path) -> Vec<Path> {
+            map.range::<Path, (Bound<&Path>, Bound<&Path>)>((
+                    Bound::Included(parent),
+                    Bound::Unbounded,
+                ))
+                .take_while(|(p, _)| Path::is_parent(parent, p))
+                .map(|(p, _)| p.clone())
+                .collect::<Vec<Path>>()
+        }
         if let Some(path) = self.paths.netidx_path(&*update.base) {
-            self.parents.insert(path, (Instant::now(), update.files.clone()));
+            self.parents
+                .insert(path, (Instant::now(), update.files.clone()));
             for up in update.changes {
-                
+                match up.item {
+                    StructureItem::File => {
+                        if let Some(path) = self.paths.netidx_path(&*up.path) {
+                            match up.action {
+                                StructureAction::Added => {
+                                    if let Err(e) = dp.advertise(path.clone()) {
+                                        warn!("failed to advertise path {}, {}", path, e)
+                                    }
+                                    self.advertised.insert(path, (up.path.clone(), None));
+                                }
+                                StructureAction::Removed => self.remove(&path),
+                            }
+                        }
+                    }
+                    StructureItem::Directory => match up.action {
+                        StructureAction::Added => (),
+                        StructureAction::Removed => {
+                            if let Some(path) = self.paths.netidx_path(&*up.path) {
+                                for path in children(&self.advertised, &path) {
+                                    self.remove(&path)
+                                }
+                                for path in children(&self.parents, &path) {
+                                    self.parents.remove(&path);
+                                }
+                            }
+                        }
+                    },
+                }
             }
         }
         for (path, typ) in &files.paths {
