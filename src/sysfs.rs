@@ -27,12 +27,12 @@ use triomphe::Arc;
 pub(crate) type Map<K, V> = CMap<K, V, 64>;
 
 pub(crate) struct Paths {
-    base: PathBuf,
+    base: Arc<PathBuf>,
     netidx_base: NPath,
 }
 
 impl Paths {
-    pub(crate) fn new(base: PathBuf, netidx_base: NPath) -> Self {
+    pub(crate) fn new(base: Arc<PathBuf>, netidx_base: NPath) -> Self {
         Self { base, netidx_base }
     }
 
@@ -68,15 +68,16 @@ pub(crate) enum StructureAction {
 }
 
 pub(crate) struct StructureItemUpdate {
-    path: Arc<PathBuf>,
-    action: StructureAction,
-    item: StructureItem,
+    pub(crate) path: Arc<PathBuf>,
+    pub(crate) action: StructureAction,
+    pub(crate) item: StructureItem,
 }
 
 pub(crate) struct StructureUpdate {
-    id: Fid,
-    files: Files,
-    changes: Vec<StructureItemUpdate>,
+    pub(crate) id: Fid,
+    pub(crate) base: Arc<PathBuf>,
+    pub(crate) files: Files,
+    pub(crate) changes: Vec<StructureItemUpdate>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -195,11 +196,12 @@ impl Files {
                 fs::canonicalize(&*path)
             );
             let target = Arc::new(target);
-            let symlinks = self.symlinks.insert(path, target).0;
-            Self {
+            let symlinks = self.symlinks.insert(path, target.clone()).0;
+            let t = Self {
                 symlinks,
                 ..self.clone()
-            }
+            };
+            t.walk_(target, max_depth, depth)
         } else if st.is_dir() {
             let mut t = self.clone();
             if depth < max_depth {
@@ -253,7 +255,7 @@ async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)>
 }
 
 pub(crate) async fn poll_file(
-    file: PathBuf,
+    file: Arc<PathBuf>,
     id: Fid,
     updates: UnboundedSender<(Fid, Value)>,
     first: oneshot::Sender<Value>,
@@ -326,7 +328,7 @@ impl Fid {
 }
 
 enum FileReq {
-    StartPolling(Fid, PathBuf, oneshot::Sender<Value>),
+    StartPolling(Fid, Arc<PathBuf>, oneshot::Sender<Value>),
     StopPolling(Fid),
 }
 
@@ -376,7 +378,7 @@ impl FilePoller {
         Self(tx_req)
     }
 
-    pub(crate) async fn start(&self, path: PathBuf) -> Result<(Fid, Value)> {
+    pub(crate) async fn start(&self, path: Arc<PathBuf>) -> Result<(Fid, Value)> {
         let id = Fid::new();
         let (tx, rx) = oneshot::channel();
         match self.0.unbounded_send(FileReq::StartPolling(id, path, tx)) {
@@ -400,12 +402,17 @@ async fn poll_structure(
     path: Arc<PathBuf>,
     id: Fid,
     mut updates: UnboundedSender<StructureUpdate>,
-    first: oneshot::Sender<Option<Files>>,
+    first: oneshot::Sender<Option<StructureUpdate>>,
     mut stop: oneshot::Receiver<()>,
 ) {
     const MAX_SKIP: u8 = 120;
     let mut files = task::block_in_place(|| Files::empty().walk(path.clone(), 2));
-    let _ = first.send(Some(files.clone()));
+    let _ = first.send(Some(StructureUpdate {
+        id,
+        base: path.clone(),
+        files: files.clone(),
+        changes: Files::empty().diff(&files),
+    }));
     let mut clock = time::interval(Duration::from_secs(1));
     let mut skip: u8 = 0;
     let mut skipped: u8 = 0;
@@ -426,6 +433,7 @@ async fn poll_structure(
                     }
                     let r = updates.unbounded_send(StructureUpdate {
                         id,
+                        base: path.clone(),
                         files: files.clone(),
                         changes
                     });
@@ -440,7 +448,7 @@ async fn poll_structure(
 }
 
 enum StructureReq {
-    StartPolling(Fid, Arc<PathBuf>, oneshot::Sender<Option<Files>>),
+    StartPolling(Fid, Arc<PathBuf>, oneshot::Sender<Option<StructureUpdate>>),
     StopPolling(Fid),
 }
 
@@ -480,18 +488,16 @@ impl StructurePoller {
         Self(tx)
     }
 
-    pub(crate) async fn start(&mut self, path: PathBuf) -> Result<Option<(Fid, Files)>> {
+    pub(crate) async fn start(&mut self, path: Arc<PathBuf>) -> Result<Option<StructureUpdate>> {
         let (tx_init, rx_init) = oneshot::channel();
         let id = Fid::new();
-        if let Err(_) =
-            self.0
-                .unbounded_send(StructureReq::StartPolling(id, Arc::new(path), tx_init))
-        {
+        let req = StructureReq::StartPolling(id, path, tx_init);
+        if let Err(_) = self.0.unbounded_send(req) {
             bail!("structure poller is dead")
         }
         match rx_init.await {
             Err(_) => bail!("failed to get initial value"),
-            Ok(f) => Ok(f.map(|f| (id, f))),
+            Ok(f) => Ok(f),
         }
     }
 
