@@ -94,18 +94,18 @@ impl Published {
     fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
         fn children<T>(map: &BTreeMap<Path, T>, parent: &Path) -> Vec<Path> {
             map.range::<Path, (Bound<&Path>, Bound<&Path>)>((
-                    Bound::Included(parent),
-                    Bound::Unbounded,
-                ))
-                .take_while(|(p, _)| Path::is_parent(parent, p))
-                .map(|(p, _)| p.clone())
-                .collect::<Vec<Path>>()
+                Bound::Included(parent),
+                Bound::Unbounded,
+            ))
+            .take_while(|(p, _)| Path::is_parent(parent, p))
+            .map(|(p, _)| p.clone())
+            .collect::<Vec<Path>>()
         }
         if let Some(path) = self.paths.netidx_path(&*update.base) {
             self.parents
                 .insert(path, (Instant::now(), update.files.clone()));
             for up in update.changes {
-                match up.item {
+                match &up.item {
                     StructureItem::File => {
                         if let Some(path) = self.paths.netidx_path(&*up.path) {
                             match up.action {
@@ -132,18 +132,14 @@ impl Published {
                             }
                         }
                     },
-                }
-            }
-        }
-        for (path, typ) in &files.paths {
-            match typ {
-                FType::Directory => (),
-                FType::File => {
-                    let npath = files.netidx_path(base, path);
-                    if let Err(e) = dp.advertise(npath.clone()) {
-                        warn!("failed to advertise path {}, {}", npath, e)
-                    }
-                    t.advertised.insert(npath, (path.clone(), None));
+                    StructureItem::Symlink { target } => match update.files.resolve(&target) {
+                        Err(e) => {
+                            warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e)
+                        }
+                        Ok((target, typ)) => match typ {
+                            
+                        }
+                    },
                 }
             }
         }
