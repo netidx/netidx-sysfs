@@ -59,7 +59,6 @@ struct Published {
     by_fid: FxHashMap<Fid, Id>,
     advertised: BTreeMap<Path, (Arc<PathBuf>, Option<Id>)>,
     aliased: BTreeMap<Path, Path>,
-    parents: BTreeMap<Path, (Instant, Files)>,
     paths: Paths,
 }
 
@@ -70,7 +69,6 @@ impl Published {
             by_fid: HashMap::default(),
             advertised: BTreeMap::default(),
             aliased: BTreeMap::default(),
-            parents: BTreeMap::new(),
             paths,
         }
     }
@@ -128,97 +126,78 @@ impl Published {
     }
 
     fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
-        fn children<T>(map: &BTreeMap<Path, T>, parent: &Path) -> Vec<Path> {
-            map.range::<Path, (Bound<&Path>, Bound<&Path>)>((
-                Bound::Included(parent),
-                Bound::Unbounded,
-            ))
-            .take_while(|(p, _)| Path::is_parent(parent, p))
-            .map(|(p, _)| p.clone())
-            .collect::<Vec<Path>>()
-        }
-        if let Some(base) = self.paths.netidx_path(&*update.base) {
-            self.parents
-                .insert(base, (Instant::now(), update.files.clone()));
-            for up in update.changes {
-                match &up.item {
-                    StructureItem::File => {
-                        if let Some(path) = self.paths.netidx_path(&*up.path) {
-                            match up.action {
-                                StructureAction::Added => {
-                                    if let Err(e) = dp.advertise(path.clone()) {
-                                        warn!("failed to advertise path {}, {}", path, e)
-                                    }
-                                    self.advertised.insert(path, (up.path.clone(), None));
+        for up in update.changes {
+            match &up.item {
+                StructureItem::File => {
+                    if let Some(path) = self.paths.netidx_path(&*up.path) {
+                        match up.action {
+                            StructureAction::Removed => self.remove(&path),
+                            StructureAction::Added => {
+                                if let Err(e) = dp.advertise(path.clone()) {
+                                    warn!("failed to advertise path {}, {}", path, e)
                                 }
-                                StructureAction::Removed => self.remove(&path),
+                                self.advertised.insert(path, (up.path.clone(), None));
                             }
                         }
                     }
-                    StructureItem::Directory => match up.action {
-                        StructureAction::Added => (),
-                        StructureAction::Removed => {
-                            if let Some(path) = self.paths.netidx_path(&*up.path) {
-                                for path in children(&self.advertised, &path) {
-                                    self.remove(&path)
-                                }
-                                for path in children(&self.parents, &path) {
-                                    self.parents.remove(&path);
-                                }
-                            }
-                        }
-                    },
-                    StructureItem::Symlink { target } => match update.files.resolve(&target) {
+                }
+                StructureItem::Directory => (),
+                StructureItem::Symlink { target } => match up.action {
+                    StructureAction::Removed => match update.previous.resolve(&target) {
                         Err(e) => {
                             warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e)
                         }
                         Ok((target, typ)) => match typ {
-                            FType::File => match up.action {
-                                StructureAction::Removed => self.remove_file_link(dp, &up.path),
-                                StructureAction::Added => self.add_file_link(dp, &*up.path, target),
-                            },
+                            FType::File => self.remove_file_link(dp, &up.path),
+                            FType::Directory => {
+                                let (src_path, _) = match self.resolve_symlink(&*up.path, target) {
+                                    Some((s, t)) => (s, t),
+                                    None => continue,
+                                };
+                                update.previous.iter_children_no_pfx(target, |p, typ| {
+                                    let p = p.as_os_str().to_string_lossy();
+                                    match typ {
+                                        FType::Directory => (),
+                                        FType::File => {
+                                            let src_path = src_path.append(&p);
+                                            dp.remove_advertisement(&src_path);
+                                            self.aliased.remove(&src_path);
+                                        }
+                                    }
+                                })
+                            }
+                        },
+                    },
+                    StructureAction::Added => match update.current.resolve(&target) {
+                        Err(e) => {
+                            warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e)
+                        }
+                        Ok((target, typ)) => match typ {
+                            FType::File => self.add_file_link(dp, &*up.path, target),
                             FType::Directory => {
                                 let (src_path, tgt_path) =
                                     match self.resolve_symlink(&*up.path, target) {
                                         Some((s, t)) => (s, t),
                                         None => continue,
                                     };
-                                let children = update
-                                    .files
-                                    .paths
-                                    .range(
-                                        Bound::Excluded(Arc::new(target.clone())),
-                                        Bound::Unbounded,
-                                    )
-                                    .take_while(|(p, _)| p.starts_with(base.as_ref()))
-                                    .filter_map(|(p, t)| {
-                                        p.strip_prefix(target).ok().map(|p| (p, t))
-                                    });
-                                for (p, typ) in children {
+                                update.current.iter_children_no_pfx(target, |p, typ| {
                                     let p = p.as_os_str().to_string_lossy();
                                     match typ {
                                         FType::Directory => (),
-                                        FType::File => match up.action {
-                                            StructureAction::Removed => {
-                                                let src_path = src_path.append(&p);
-                                                dp.remove_advertisement(&src_path);
-                                                self.aliased.remove(&src_path);
+                                        FType::File => {
+                                            let src_path = src_path.append(&p);
+                                            let tgt_path = tgt_path.append(&p);
+                                            if let Err(e) = dp.advertise(src_path.clone()) {
+                                                warn!("failed to advertise {}, {}", src_path, e)
                                             }
-                                            StructureAction::Added => {
-                                                let src_path = src_path.append(&p);
-                                                let tgt_path = tgt_path.append(&p);
-                                                if let Err(e) = dp.advertise(src_path.clone()) {
-                                                    warn!("failed to advertise {}, {}", src_path, e)
-                                                }
-                                                self.aliased.insert(src_path, tgt_path);
-                                            }
-                                        },
+                                            self.aliased.insert(src_path, tgt_path);
+                                        }
                                     }
-                                }
+                                })
                             }
                         },
                     },
-                }
+                },
             }
         }
     }

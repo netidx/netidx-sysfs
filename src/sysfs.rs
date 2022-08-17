@@ -76,7 +76,8 @@ pub(crate) struct StructureItemUpdate {
 pub(crate) struct StructureUpdate {
     pub(crate) id: Fid,
     pub(crate) base: Arc<PathBuf>,
-    pub(crate) files: Files,
+    pub(crate) current: Files,
+    pub(crate) previous: Files,
     pub(crate) changes: Vec<StructureItemUpdate>,
 }
 
@@ -97,6 +98,22 @@ impl Files {
         Self {
             paths: Map::default(),
             symlinks: Map::default(),
+        }
+    }
+
+    pub(crate) fn iter_children_no_pfx<F: FnMut(&std::path::Path, &FType)>(&self, base: &PathBuf, f: F) {
+        let children = self
+            .paths
+            .range(
+                Bound::Excluded(Arc::new(base.clone())),
+                Bound::Unbounded,
+            )
+            .take_while(|(p, _)| p.starts_with(base))
+            .filter_map(|(p, t)| {
+                p.strip_prefix(base).ok().map(|p| (p, t))
+            });
+        for (p, t) in children {
+            f(p, t)
         }
     }
 
@@ -410,7 +427,8 @@ async fn poll_structure(
     let _ = first.send(Some(StructureUpdate {
         id,
         base: path.clone(),
-        files: files.clone(),
+        current: files.clone(),
+        previous: Files::empty(),
         changes: Files::empty().diff(&files),
     }));
     let mut clock = time::interval(Duration::from_secs(1));
@@ -423,22 +441,24 @@ async fn poll_structure(
                     skipped += 1;
                 } else {
                     skipped = 0;
-                    let files_ = task::block_in_place(|| Files::walk(&files, path.clone(), 2));
-                    let changes = files.diff(&files_);
-                    files = files_;
+                    let current = task::block_in_place(|| Files::walk(&files, path.clone(), 2));
+                    let previous = files.clone();
+                    let changes = previous.diff(&current);
+                    files = current.clone();
                     if changes.len() == 0 {
                         skip = min(MAX_SKIP, skip + 1);
                     } else {
                         skip >>= 1;
-                    }
-                    let r = updates.unbounded_send(StructureUpdate {
-                        id,
-                        base: path.clone(),
-                        files: files.clone(),
-                        changes
-                    });
-                    if let Err(_) = r {
-                        break
+                        let r = updates.unbounded_send(StructureUpdate {
+                            id,
+                            base: path.clone(),
+                            current,
+                            previous,
+                            changes
+                        });
+                        if let Err(_) = r {
+                            break
+                        }
                     }
                 }
             }
