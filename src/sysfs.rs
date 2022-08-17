@@ -27,8 +27,8 @@ use triomphe::Arc;
 pub(crate) type Map<K, V> = CMap<K, V, 64>;
 
 pub(crate) struct Paths {
-    base: Arc<PathBuf>,
-    netidx_base: NPath,
+    pub(crate) base: Arc<PathBuf>,
+    pub(crate) netidx_base: NPath,
 }
 
 impl Paths {
@@ -88,8 +88,8 @@ pub(crate) enum FType {
 
 #[derive(Clone)]
 pub(crate) struct Files {
-    paths: Map<Arc<PathBuf>, FType>,
-    symlinks: Map<Arc<PathBuf>, Arc<PathBuf>>,
+    pub(crate) paths: Map<Arc<PathBuf>, FType>,
+    pub(crate) symlinks: Map<Arc<PathBuf>, Arc<PathBuf>>,
 }
 
 impl Files {

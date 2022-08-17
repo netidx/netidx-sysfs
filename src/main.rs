@@ -84,11 +84,47 @@ impl Published {
     }
 
     fn remove(&mut self, path: &Path) {
-        if let Some((_, Some(id))) = self.advertised.remove(&path) {
+        if let Some((_, Some(id))) = self.advertised.remove(path) {
             if let Some(pf) = self.published.remove(&id) {
                 self.by_fid.remove(&pf.fid);
             }
         }
+    }
+
+    fn resolve_symlink<T: AsRef<std::path::Path>, U: AsRef<std::path::Path>>(
+        &self,
+        src: T,
+        tgt: U,
+    ) -> Option<(Path, Path)> {
+        Some((
+            self.paths.netidx_path(src.as_ref())?,
+            self.paths.netidx_path(tgt.as_ref())?,
+        ))
+    }
+
+    fn add_file_link<T: AsRef<std::path::Path>, U: AsRef<std::path::Path>>(
+        &mut self,
+        dp: &DefaultHandle,
+        src: T,
+        tgt: U,
+    ) {
+        let (src, tgt) = match self.resolve_symlink(src, tgt) {
+            Some((s, t)) => (s, t),
+            None => return,
+        };
+        if let Err(e) = dp.advertise(src.clone()) {
+            warn!("failed to advertise path {}, {}", src, e)
+        }
+        self.aliased.insert(src, tgt);
+    }
+
+    fn remove_file_link(&mut self, dp: &DefaultHandle, src: &Arc<PathBuf>) {
+        let src = match self.paths.netidx_path(&**src) {
+            Some(p) => p,
+            None => return,
+        };
+        dp.remove_advertisement(&src);
+        self.aliased.remove(&src);
     }
 
     fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
@@ -101,9 +137,9 @@ impl Published {
             .map(|(p, _)| p.clone())
             .collect::<Vec<Path>>()
         }
-        if let Some(path) = self.paths.netidx_path(&*update.base) {
+        if let Some(base) = self.paths.netidx_path(&*update.base) {
             self.parents
-                .insert(path, (Instant::now(), update.files.clone()));
+                .insert(base, (Instant::now(), update.files.clone()));
             for up in update.changes {
                 match &up.item {
                     StructureItem::File => {
@@ -137,70 +173,54 @@ impl Published {
                             warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e)
                         }
                         Ok((target, typ)) => match typ {
-                            
-                        }
+                            FType::File => match up.action {
+                                StructureAction::Removed => self.remove_file_link(dp, &up.path),
+                                StructureAction::Added => self.add_file_link(dp, &*up.path, target),
+                            },
+                            FType::Directory => {
+                                let (src_path, tgt_path) =
+                                    match self.resolve_symlink(&*up.path, target) {
+                                        Some((s, t)) => (s, t),
+                                        None => continue,
+                                    };
+                                let children = update
+                                    .files
+                                    .paths
+                                    .range(
+                                        Bound::Excluded(Arc::new(target.clone())),
+                                        Bound::Unbounded,
+                                    )
+                                    .take_while(|(p, _)| p.starts_with(base.as_ref()))
+                                    .filter_map(|(p, t)| {
+                                        p.strip_prefix(target).ok().map(|p| (p, t))
+                                    });
+                                for (p, typ) in children {
+                                    let p = p.as_os_str().to_string_lossy();
+                                    match typ {
+                                        FType::Directory => (),
+                                        FType::File => match up.action {
+                                            StructureAction::Removed => {
+                                                let src_path = src_path.append(&p);
+                                                dp.remove_advertisement(&src_path);
+                                                self.aliased.remove(&src_path);
+                                            }
+                                            StructureAction::Added => {
+                                                let src_path = src_path.append(&p);
+                                                let tgt_path = tgt_path.append(&p);
+                                                if let Err(e) = dp.advertise(src_path.clone()) {
+                                                    warn!("failed to advertise {}, {}", src_path, e)
+                                                }
+                                                self.aliased.insert(src_path, tgt_path);
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        },
                     },
                 }
             }
         }
-        for (src, tgt) in &files.symlinks {
-            match files.resolve(tgt) {
-                Err(e) => {
-                    warn!("bad symlink {:?} -> {:?} {}", src, tgt, e)
-                }
-                Ok((tgt, typ)) => match typ {
-                    FType::File => {
-                        let src_path = files.netidx_path(base, src);
-                        let tgt_path = files.netidx_path(base, tgt);
-                        if t.advertised.contains_key(&tgt_path) {
-                            if let Err(e) = dp.advertise(src_path.clone()) {
-                                warn!("failed to advertise path {}, {}", src_path, e)
-                            }
-                            t.aliased.insert(src_path, tgt_path);
-                        } else {
-                            warn!("symlink to missing path {} -> {}", src_path, tgt_path)
-                        }
-                    }
-                    FType::Directory => {
-                        let src_path = files.netidx_path(base, src);
-                        let tgt_path = files.netidx_path(base, tgt);
-                        let children = files
-                            .paths
-                            .range::<std::path::Path, (Bound<&std::path::Path>, Bound<&std::path::Path>)>((
-                                Bound::Excluded(tgt),
-                                Bound::Unbounded,
-                            ))
-                            .take_while(|(p, _)| p.starts_with(tgt))
-                            .map(|(p, t)| (p.strip_prefix(tgt), t));
-                        for (p, typ) in children {
-                            let p = match p {
-                                Ok(p) => p,
-                                Err(_) => continue,
-                            };
-                            match typ {
-                                FType::Directory => (),
-                                FType::File => {
-                                    let src_path = files.netidx_path(&src_path, p);
-                                    let tgt_path = files.netidx_path(&tgt_path, p);
-                                    if t.advertised.contains_key(&tgt_path) {
-                                        if let Err(e) = dp.advertise(src_path.clone()) {
-                                            warn!("failed to advertise path {}, {}", src_path, e)
-                                        }
-                                        t.aliased.insert(src_path, tgt_path);
-                                    } else {
-                                        warn!(
-                                            "symlink to missing path {} -> {}",
-                                            src_path, tgt_path
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-            }
-        }
-        t
     }
 }
 
