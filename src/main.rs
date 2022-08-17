@@ -57,8 +57,8 @@ struct PublishedFile {
 struct Published {
     published: FxHashMap<Id, PublishedFile>,
     by_fid: FxHashMap<Fid, Id>,
-    advertised: BTreeMap<Path, (Arc<PathBuf>, Option<Id>)>,
-    aliased: BTreeMap<Path, Path>,
+    advertised: FxHashMap<Path, (Arc<PathBuf>, Option<Id>)>,
+    aliased: FxHashMap<Path, Path>,
     paths: Paths,
 }
 
@@ -67,8 +67,8 @@ impl Published {
         Self {
             published: HashMap::default(),
             by_fid: HashMap::default(),
-            advertised: BTreeMap::default(),
-            aliased: BTreeMap::default(),
+            advertised: HashMap::default(),
+            aliased: HashMap::default(),
             paths,
         }
     }
@@ -89,7 +89,7 @@ impl Published {
         }
     }
 
-    fn resolve_symlink<T: AsRef<std::path::Path>, U: AsRef<std::path::Path>>(
+    fn netidx_paths<T: AsRef<std::path::Path>, U: AsRef<std::path::Path>>(
         &self,
         src: T,
         tgt: U,
@@ -106,7 +106,7 @@ impl Published {
         src: T,
         tgt: U,
     ) {
-        let (src, tgt) = match self.resolve_symlink(src, tgt) {
+        let (src, tgt) = match self.netidx_paths(src, tgt) {
             Some((s, t)) => (s, t),
             None => return,
         };
@@ -128,6 +128,7 @@ impl Published {
     fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
         for up in update.changes {
             match &up.item {
+                StructureItem::Directory => (),
                 StructureItem::File => {
                     if let Some(path) = self.paths.netidx_path(&*up.path) {
                         match up.action {
@@ -141,16 +142,13 @@ impl Published {
                         }
                     }
                 }
-                StructureItem::Directory => (),
                 StructureItem::Symlink { target } => match up.action {
                     StructureAction::Removed => match update.previous.resolve(&target) {
-                        Err(e) => {
-                            warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e)
-                        }
+                        Err(e) => warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e),
                         Ok((target, typ)) => match typ {
                             FType::File => self.remove_file_link(dp, &up.path),
                             FType::Directory => {
-                                let (src_path, _) = match self.resolve_symlink(&*up.path, target) {
+                                let (src_path, _) = match self.netidx_paths(&*up.path, target) {
                                     Some((s, t)) => (s, t),
                                     None => continue,
                                 };
@@ -169,14 +167,12 @@ impl Published {
                         },
                     },
                     StructureAction::Added => match update.current.resolve(&target) {
-                        Err(e) => {
-                            warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e)
-                        }
+                        Err(e) => warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e),
                         Ok((target, typ)) => match typ {
                             FType::File => self.add_file_link(dp, &*up.path, target),
                             FType::Directory => {
                                 let (src_path, tgt_path) =
-                                    match self.resolve_symlink(&*up.path, target) {
+                                    match self.netidx_paths(&*up.path, target) {
                                         Some((s, t)) => (s, t),
                                         None => continue,
                                     };
