@@ -354,7 +354,7 @@ async fn main() -> Result<()> {
             up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
             (p, reply) = dp.select_next_some() => {
                 match published.resolve(&p) {
-                    Some(_) => {
+                    Some(AdvertisedFile {typ: FType::File, ..}) => {
                         handle_subscribe_advertised(
                             &mut published,
                             &publisher,
@@ -363,28 +363,35 @@ async fn main() -> Result<()> {
                             reply
                         ).await
                     },
-                    None => if let Some(mut fspath) = published.paths.fs_path(&p) {
-                        fspath.pop();
-                        let fspath = if fspath.starts_with(&*sysfs) {
-                            Arc::new(fspath)
-                        } else {
-                            sysfs.clone()
-                        };
-                        match structure_poller.start(fspath).await {
-                            Ok(None) => (), // already polling this and it doesn't exist
-                            Err(e) => warn!("failed to poll {}", e),
-                            Ok(Some(up)) => {
-                                published.advertise(&dp, up);
-                                handle_subscribe_advertised(
-                                    &mut published,
-                                    &publisher,
-                                    &file_poller,
-                                    &p,
-                                    reply
-                                ).await
-                            },
+                    r@ (None | Some(AdvertisedFile {typ: FType::Directory, ..})) => {
+                        let dir = r.is_some();
+                        if let Some(mut fspath) = published.paths.fs_path(&p) {
+                            let fspath = if dir {
+                                Arc::new(fspath)
+                            } else {
+                                fspath.pop();
+                                if fspath.starts_with(&*sysfs) {
+                                    Arc::new(fspath)
+                                } else {
+                                    sysfs.clone()
+                                }
+                            };
+                            match structure_poller.start(fspath).await {
+                                Ok(None) => (), // already polling this and it doesn't exist
+                                Err(e) => warn!("failed to poll {}", e),
+                                Ok(Some(up)) => {
+                                    published.advertise(&dp, up);
+                                    handle_subscribe_advertised(
+                                        &mut published,
+                                        &publisher,
+                                        &file_poller,
+                                        &p,
+                                        reply
+                                    ).await
+                                },
+                            }
                         }
-                    },
+                    }
                 }
             },
             r = rx_file_updates.select_next_some() => match r {
