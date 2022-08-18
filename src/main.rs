@@ -58,6 +58,7 @@ struct PublishedFile {
     val: Val,
 }
 
+#[derive(Debug)]
 struct AdvertisedFile {
     fspath: Arc<PathBuf>,
     typ: FType,
@@ -186,6 +187,7 @@ impl Published {
                                     Some((s, t)) => (s, t),
                                     None => continue,
                                 };
+                                dp.remove_advertisement(&src_path);
                                 update.previous.iter_children_no_pfx(target, |p, _| {
                                     let p = p.as_os_str().to_string_lossy();
                                     let src_path = src_path.append(&p);
@@ -205,6 +207,15 @@ impl Published {
                                         Some((s, t)) => (s, t),
                                         None => continue,
                                     };
+                                if let Err(e) = dp.advertise(src_path.clone()) {
+                                    warn!("failed to advertise path {}, {}", src_path, e)
+                                }
+                                let adf = AdvertisedFile {
+                                    fspath: up.path.clone(),
+                                    typ: FType::Directory,
+                                    id: None
+                                };
+                                self.advertised.insert(src_path.clone(), adf);
                                 update.current.iter_children_no_pfx(target, |p, _| {
                                     let p = p.as_os_str().to_string_lossy();
                                     let src_path = src_path.append(&p);
@@ -333,8 +344,6 @@ async fn main() -> Result<()> {
     let opts = Params::from_args();
     let (cfg, auth) = opts.common.load();
     let timeout = opts.timeout.map(Duration::from_secs);
-    let st = Instant::now();
-    dbg!(st.elapsed());
     let publisher = Publisher::new(cfg, auth, opts.bind).await?;
     let (tx_file_updates, rx_file_updates) = mpsc::unbounded();
     let (tx_structure_updates, mut rx_structure_updates) = mpsc::unbounded();
@@ -377,7 +386,7 @@ async fn main() -> Result<()> {
                                 }
                             };
                             match structure_poller.start(fspath).await {
-                                Ok(None) => (), // already polling this and it doesn't exist
+                                Ok(None) => (), // already polling this
                                 Err(e) => warn!("failed to poll {}", e),
                                 Ok(Some(up)) => {
                                     published.advertise(&dp, up);

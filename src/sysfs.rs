@@ -43,6 +43,7 @@ impl Paths {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum StructureItem {
     File,
     Directory,
@@ -58,17 +59,20 @@ impl StructureItem {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum StructureAction {
     Added,
     Removed,
 }
 
+#[derive(Debug)]
 pub(crate) struct StructureItemUpdate {
     pub(crate) path: Arc<PathBuf>,
     pub(crate) action: StructureAction,
     pub(crate) item: StructureItem,
 }
 
+#[derive(Debug)]
 pub(crate) struct StructureUpdate {
     pub(crate) current: Files,
     pub(crate) previous: Files,
@@ -81,7 +85,7 @@ pub(crate) enum FType {
     Directory,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Files {
     pub(crate) paths: Map<Arc<PathBuf>, FType>,
     pub(crate) symlinks: Map<Arc<PathBuf>, Arc<PathBuf>>,
@@ -429,7 +433,7 @@ async fn poll_structure(
     mut stop: oneshot::Receiver<()>,
 ) {
     const MAX_SKIP: u8 = 120;
-    let mut files = task::block_in_place(|| Files::empty().walk(&base, path.clone(), 2));
+    let mut files = task::block_in_place(|| Files::empty().walk(&base, path.clone(), 1));
     let _ = first.send(Some(StructureUpdate {
         current: files.clone(),
         previous: Files::empty(),
@@ -445,7 +449,7 @@ async fn poll_structure(
                     skipped += 1;
                 } else {
                     skipped = 0;
-                    let current = task::block_in_place(|| Files::walk(&files, &base, path.clone(), 2));
+                    let current = task::block_in_place(|| Files::walk(&files, &base, path.clone(), 1));
                     let previous = files.clone();
                     let changes = previous.diff(&current);
                     files = current.clone();
@@ -487,6 +491,7 @@ impl StructurePoller {
         while let Some(r) = req.next().await {
             match r {
                 StructureReq::StopByPath(path) => {
+                    warn!("stop polling {:?}", path);
                     if let Some(id) = by_path.remove(&path) {
                         by_id.remove(&id);
                     }
@@ -495,6 +500,7 @@ impl StructurePoller {
                     if by_path.contains_key(&path) {
                         let _ = initial.send(None);
                     } else {
+                        warn!("start polling {:?}", path);
                         by_path.insert(path.clone(), id);
                         let (tx_stop, rx_stop) = oneshot::channel();
                         by_id.insert(id, (path.clone(), tx_stop));
