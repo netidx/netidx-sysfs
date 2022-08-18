@@ -5,7 +5,11 @@ extern crate serde_derive;
 mod sysfs;
 use crate::sysfs::{FType, Fid, FilePoller, Files, Paths, StructurePoller, StructureUpdate};
 use anyhow::Result;
-use futures::{channel::mpsc, prelude::*, select_biased};
+use futures::{
+    channel::{mpsc, oneshot},
+    prelude::*,
+    select_biased,
+};
 use fxhash::FxHashMap;
 use log::warn;
 use netidx::{
@@ -15,9 +19,8 @@ use netidx::{
 };
 use netidx_tools::ClientParams;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     mem,
-    ops::Bound,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -199,6 +202,44 @@ impl Published {
     }
 }
 
+async fn handle_subscribe_advertised(
+    published: &mut Published,
+    publisher: &Publisher,
+    file_poller: &FilePoller,
+    path: &Path,
+    reply: oneshot::Sender<()>,
+) {
+    if let Some((fspath, id)) = published.resolve(path) {
+        match id {
+            Some(id) => match publisher.alias(*id, path.clone()) {
+                Ok(()) => (),
+                Err(e) => warn!("failed to alias {}, {}", path, e),
+            },
+            None => match file_poller.start(fspath.clone()).await {
+                Err(e) => warn!("polling file {} failed {}", path, e),
+                Ok((fid, v)) => {
+                    let flags = PublishFlags::DESTROY_ON_IDLE;
+                    match publisher.publish_with_flags(flags, path.clone(), v) {
+                        Err(e) => warn!("failed to publish {}, {}", path, e),
+                        Ok(val) => {
+                            let vid = val.id();
+                            *id = Some(vid);
+                            let pf = PublishedFile {
+                                fid,
+                                path: path.clone(),
+                                val,
+                            };
+                            published.published.insert(vid, pf);
+                            published.by_fid.insert(fid, vid);
+                            let _ = reply.send(());
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -209,21 +250,30 @@ async fn main() -> Result<()> {
     dbg!(st.elapsed());
     let publisher = Publisher::new(cfg, auth, opts.bind).await?;
     let (tx_file_updates, rx_file_updates) = mpsc::unbounded();
-    let (tx_structure_updates, rx_structure_updates) = mpsc::unbounded();
+    let (tx_structure_updates, mut rx_structure_updates) = mpsc::unbounded();
     let (tx_events, mut rx_events) = mpsc::unbounded();
     publisher.events(tx_events);
     let mut rx_file_updates = Batched::new(rx_file_updates, 10_000);
     let sysfs = Arc::new(opts.sysfs);
-    let paths = Paths::new(sysfs.clone(), opts.base.clone());
     let file_poller = FilePoller::new(tx_file_updates);
-    let structure_poller = StructurePoller::new(tx_structure_updates);
+    let mut structure_poller = StructurePoller::new(tx_structure_updates);
     let mut dp = publisher.publish_default(opts.base.clone())?;
-    let mut published = Published::new(opts.base.clone(), opts.sysfs.clone());
+    let mut published = Published::new(Paths::new(sysfs.clone(), opts.base.clone()));
     let mut updates = publisher.start_batch();
     loop {
         select_biased! {
+            up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
             (p, reply) = dp.select_next_some() => match published.resolve(&p) {
-                None => if let Some(mut fspath) = paths.fs_path(&p) {
+                Some(_) => {
+                    handle_subscribe_advertised(
+                        &mut published,
+                        &publisher,
+                        &file_poller,
+                        &p,
+                        reply
+                    ).await
+                },
+                None => if let Some(mut fspath) = published.paths.fs_path(&p) {
                     fspath.pop();
                     let fspath = if fspath.starts_with(&*sysfs) {
                         Arc::new(fspath)
@@ -231,40 +281,27 @@ async fn main() -> Result<()> {
                         sysfs.clone()
                     };
                     match structure_poller.start(fspath).await {
-                        Ok(Some(up)) => published.advertise(&dp, up),
-                        Ok(None) => (), // already polling this
-                        Err(e) => warn!("failed to poll "),
+                        Ok(None) => (), // already polling this and it doesn't exist
+                        Err(e) => warn!("failed to poll {}", e),
+                        Ok(Some(up)) => {
+                            published.advertise(&dp, up);
+                            handle_subscribe_advertised(
+                                &mut published,
+                                &publisher,
+                                &file_poller,
+                                &p,
+                                reply
+                            ).await
+                        },
                     }
-                }
-                Some((fspath, id)) => match id {
-                    Some(id) => match publisher.alias(*id, p.clone()) {
-                        Ok(()) => (),
-                        Err(e) => warn!("failed to alias {}, {}", p, e),
-                    },
-                    None => match file_poller.start(fspath.clone()).await {
-                        Err(e) => warn!("polling file {} failed {}", p, e),
-                        Ok((fid, v)) => {
-                            let flags = PublishFlags::DESTROY_ON_IDLE;
-                            match publisher.publish_with_flags(flags, p.clone(), v) {
-                                Err(e) => warn!("failed to publish {}, {}", p, e),
-                                Ok(val) => {
-                                    let vid = val.id();
-                                    *id = Some(vid);
-                                    published.published.insert(vid, (p.clone(), val));
-                                    published.by_fid.insert(fid, vid);
-                                    let _ = reply.send(());
-                                }
-                            }
-                        }
-                    }
-                }
+                },
             },
             r = rx_file_updates.select_next_some() => match r {
                 BatchItem::InBatch((fid, v)) => match published.by_fid.get(&fid) {
                     None => file_poller.stop(fid)?,
                     Some(id) => match published.published.get(id) {
                         None => file_poller.stop(fid)?,
-                        Some((_, val)) => val.update_changed(&mut updates, v),
+                        Some(pv) => pv.val.update_changed(&mut updates, v),
                     }
                 }
                 BatchItem::EndBatch => {
@@ -275,8 +312,8 @@ async fn main() -> Result<()> {
             e = rx_events.select_next_some() => match e {
                 Event::Subscribe(_, _) | Event::Unsubscribe(_, _) => (),
                 Event::Destroyed(id) => {
-                    if let Some((p, _)) = published.published.remove(&id) {
-                        if let Some((_, ref mut id)) = published.resolve(&p) {
+                    if let Some(pv) = published.published.remove(&id) {
+                        if let Some((_, ref mut id)) = published.resolve(&pv.path) {
                             *id = None;
                         }
                     }
