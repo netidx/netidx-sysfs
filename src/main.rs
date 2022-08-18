@@ -1,9 +1,6 @@
-#[macro_use]
-extern crate serde_derive;
-
 //mod config;
 mod sysfs;
-use crate::sysfs::{FType, Fid, FilePoller, Files, Paths, StructurePoller, StructureUpdate};
+use crate::sysfs::{FType, Fid, FilePoller, Paths, StructurePoller, StructureUpdate};
 use anyhow::Result;
 use futures::{
     channel::{mpsc, oneshot},
