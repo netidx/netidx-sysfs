@@ -48,8 +48,8 @@ struct Params {
     timeout: Option<u64>,
     #[structopt(long = "base", help = "the base path to publish under")]
     base: Path,
-    #[structopt(long = "sysfs", help = "glob pattern of files to publish, multiple")]
-    sysfs: PathBuf,
+    #[structopt(long = "path", help = "path to the files you want to publish")]
+    path: PathBuf,
 }
 
 struct PublishedFile {
@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
     let (tx_events, mut rx_events) = mpsc::unbounded();
     publisher.events(tx_events);
     let mut rx_file_updates = Batched::new(rx_file_updates, 10_000);
-    let sysfs = Arc::new(opts.sysfs);
+    let sysfs = Arc::new(opts.path);
     let file_poller = FilePoller::new(tx_file_updates);
     let mut gc = time::interval(Duration::from_secs(60));
     let mut structure_poller = StructurePoller::new(tx_structure_updates);
