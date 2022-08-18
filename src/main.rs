@@ -213,7 +213,7 @@ impl Published {
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
                                     typ: FType::Directory,
-                                    id: None
+                                    id: None,
                                 };
                                 self.advertised.insert(src_path.clone(), adf);
                                 update.current.iter_children_no_pfx(target, |p, _| {
@@ -278,18 +278,27 @@ impl Published {
             }
         });
         for path in to_remove {
-            let base = Path::basename(&path).unwrap_or("/");
-            if !stopped.contains(base) {
-                let path = Path::from(String::from(base));
-                if let Some(fspath) = self.paths.fs_path(&path) {
-                    if let Err(e) = structure_poller.stop_by_path(Arc::new(fspath)) {
-                        warn!("failed to stop polling directory {}, {}", path, e)
+            dp.remove_advertisement(&path);
+            if let Some(adf) = advertised.remove(&path) {
+                let base = match adf.typ {
+                    FType::Directory => path.clone(),
+                    FType::File => {
+                        let base = Path::basename(&path).unwrap_or("/");
+                        stopped
+                            .get(base)
+                            .cloned()
+                            .unwrap_or_else(|| Path::from(String::from(base)))
                     }
-                    stopped.insert(path);
+                };
+                if !stopped.contains(&base) {
+                    if let Some(fspath) = self.paths.fs_path(&base) {
+                        if let Err(e) = structure_poller.stop_by_path(Arc::new(fspath)) {
+                            warn!("failed to stop polling directory {}, {}", path, e)
+                        }
+                        stopped.insert(base);
+                    }
                 }
             }
-            dp.remove_advertisement(&path);
-            advertised.remove(&path);
         }
     }
 }
