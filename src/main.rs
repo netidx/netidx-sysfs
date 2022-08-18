@@ -58,10 +58,16 @@ struct PublishedFile {
     val: Val,
 }
 
+struct AdvertisedFile {
+    fspath: Arc<PathBuf>,
+    typ: FType,
+    id: Option<Id>,
+}
+
 struct Published {
     published: FxHashMap<Id, PublishedFile>,
     by_fid: FxHashMap<Fid, Id>,
-    advertised: BTreeMap<Path, (Arc<PathBuf>, Option<Id>)>,
+    advertised: BTreeMap<Path, AdvertisedFile>,
     aliased: FxHashMap<Path, Path>,
     used: FxHashMap<Path, Instant>,
     paths: Paths,
@@ -79,7 +85,7 @@ impl Published {
         }
     }
 
-    fn resolve(&mut self, path: &Path) -> Option<&mut (Arc<PathBuf>, Option<Id>)> {
+    fn resolve(&mut self, path: &Path) -> Option<&mut AdvertisedFile> {
         let tgt = self.aliased.get(path).cloned();
         match tgt {
             Some(tgt) => self.resolve(&tgt),
@@ -88,7 +94,7 @@ impl Published {
     }
 
     fn remove(&mut self, path: &Path) {
-        if let Some((_, Some(id))) = self.advertised.remove(path) {
+        if let Some(AdvertisedFile { id: Some(id), .. }) = self.advertised.remove(path) {
             if let Some(pf) = self.published.remove(&id) {
                 self.by_fid.remove(&pf.fid);
             }
@@ -134,7 +140,24 @@ impl Published {
     fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
         for up in update.changes {
             match &up.item {
-                StructureItem::Directory => (),
+                StructureItem::Directory => {
+                    if let Some(path) = self.paths.netidx_path(&*up.path) {
+                        match up.action {
+                            StructureAction::Removed => self.remove(&path),
+                            StructureAction::Added => {
+                                if let Err(e) = dp.advertise(path.clone()) {
+                                    warn!("failed to advertise path {}, {}", path, e)
+                                }
+                                let adf = AdvertisedFile {
+                                    fspath: up.path.clone(),
+                                    typ: FType::Directory,
+                                    id: None,
+                                };
+                                self.advertised.insert(path, adf);
+                            }
+                        }
+                    }
+                }
                 StructureItem::File => {
                     if let Some(path) = self.paths.netidx_path(&*up.path) {
                         match up.action {
@@ -143,7 +166,12 @@ impl Published {
                                 if let Err(e) = dp.advertise(path.clone()) {
                                     warn!("failed to advertise path {}, {}", path, e)
                                 }
-                                self.advertised.insert(path, (up.path.clone(), None));
+                                let adf = AdvertisedFile {
+                                    fspath: up.path.clone(),
+                                    typ: FType::File,
+                                    id: None,
+                                };
+                                self.advertised.insert(path, adf);
                             }
                         }
                     }
@@ -158,16 +186,11 @@ impl Published {
                                     Some((s, t)) => (s, t),
                                     None => continue,
                                 };
-                                update.previous.iter_children_no_pfx(target, |p, typ| {
+                                update.previous.iter_children_no_pfx(target, |p, _| {
                                     let p = p.as_os_str().to_string_lossy();
-                                    match typ {
-                                        FType::Directory => (),
-                                        FType::File => {
-                                            let src_path = src_path.append(&p);
-                                            dp.remove_advertisement(&src_path);
-                                            self.aliased.remove(&src_path);
-                                        }
-                                    }
+                                    let src_path = src_path.append(&p);
+                                    dp.remove_advertisement(&src_path);
+                                    self.aliased.remove(&src_path);
                                 })
                             }
                         },
@@ -182,19 +205,14 @@ impl Published {
                                         Some((s, t)) => (s, t),
                                         None => continue,
                                     };
-                                update.current.iter_children_no_pfx(target, |p, typ| {
+                                update.current.iter_children_no_pfx(target, |p, _| {
                                     let p = p.as_os_str().to_string_lossy();
-                                    match typ {
-                                        FType::Directory => (),
-                                        FType::File => {
-                                            let src_path = src_path.append(&p);
-                                            let tgt_path = tgt_path.append(&p);
-                                            if let Err(e) = dp.advertise(src_path.clone()) {
-                                                warn!("failed to advertise {}, {}", src_path, e)
-                                            }
-                                            self.aliased.insert(src_path, tgt_path);
-                                        }
+                                    let src_path = src_path.append(&p);
+                                    let tgt_path = tgt_path.append(&p);
+                                    if let Err(e) = dp.advertise(src_path.clone()) {
+                                        warn!("failed to advertise {}, {}", src_path, e)
                                     }
+                                    self.aliased.insert(src_path, tgt_path);
                                 })
                             }
                         },
@@ -204,7 +222,7 @@ impl Published {
         }
     }
 
-    fn used(&mut self, path: &Path) {
+    fn used_file(&mut self, path: &Path) {
         let base = Path::basename(&path).unwrap_or_else(|| "/");
         match self.used.get_mut(base) {
             Some(i) => {
@@ -217,10 +235,14 @@ impl Published {
         }
     }
 
+    fn used_directory(&mut self, path: &Path) {
+        *self.used.entry(path.clone()).or_insert_with(Instant::now) = Instant::now();
+    }
+
     fn advertised_children<'a, 'b: 'a>(
-        advertised: &'a BTreeMap<Path, (Arc<PathBuf>, Option<Id>)>,
+        advertised: &'a BTreeMap<Path, AdvertisedFile>,
         base: &'b Path,
-    ) -> impl Iterator<Item = (&'a Path, &'a (Arc<PathBuf>, Option<Id>))> {
+    ) -> impl Iterator<Item = (&'a Path, &'a AdvertisedFile)> {
         advertised
             .range::<Path, (Bound<&Path>, Bound<&Path>)>((Bound::Included(base), Bound::Unbounded))
             .take_while(|(p, _)| Path::is_parent(base, p))
@@ -235,7 +257,7 @@ impl Published {
         used.retain(|path, last| {
             last.elapsed() < TIMEOUT || {
                 let published =
-                    Self::advertised_children(advertised, path).any(|(_, (_, id))| id.is_some());
+                    Self::advertised_children(advertised, path).any(|(_, adf)| adf.id.is_some());
                 published || {
                     to_remove.extend(
                         Self::advertised_children(advertised, path).map(|(p, _)| p.clone()),
@@ -268,33 +290,39 @@ async fn handle_subscribe_advertised(
     path: &Path,
     reply: oneshot::Sender<()>,
 ) {
-    if let Some((fspath, id)) = published.resolve(path) {
-        match id {
-            Some(id) => match publisher.alias(*id, path.clone()) {
-                Ok(()) => (),
-                Err(e) => warn!("failed to alias {}, {}", path, e),
-            },
-            None => match file_poller.start(fspath.clone()).await {
-                Err(e) => warn!("polling file {} failed {}", path, e),
-                Ok((fid, v)) => {
-                    let flags = PublishFlags::DESTROY_ON_IDLE;
-                    match publisher.publish_with_flags(flags, path.clone(), v) {
-                        Err(e) => warn!("failed to publish {}, {}", path, e),
-                        Ok(val) => {
-                            let vid = val.id();
-                            *id = Some(vid);
-                            let pf = PublishedFile {
-                                fid,
-                                path: path.clone(),
-                                val,
-                            };
-                            published.published.insert(vid, pf);
-                            published.by_fid.insert(fid, vid);
-                            let _ = reply.send(());
+    if let Some(adf) = published.resolve(path) {
+        match adf.typ {
+            FType::Directory => published.used_directory(path),
+            FType::File => {
+                match adf.id {
+                    Some(id) => match publisher.alias(id, path.clone()) {
+                        Ok(()) => (),
+                        Err(e) => warn!("failed to alias {}, {}", path, e),
+                    },
+                    None => match file_poller.start(adf.fspath.clone()).await {
+                        Err(e) => warn!("polling file {} failed {}", path, e),
+                        Ok((fid, v)) => {
+                            let flags = PublishFlags::DESTROY_ON_IDLE;
+                            match publisher.publish_with_flags(flags, path.clone(), v) {
+                                Err(e) => warn!("failed to publish {}, {}", path, e),
+                                Ok(val) => {
+                                    let vid = val.id();
+                                    adf.id = Some(vid);
+                                    let pf = PublishedFile {
+                                        fid,
+                                        path: path.clone(),
+                                        val,
+                                    };
+                                    published.published.insert(vid, pf);
+                                    published.by_fid.insert(fid, vid);
+                                    let _ = reply.send(());
+                                }
+                            }
                         }
-                    }
+                    },
                 }
-            },
+                published.used_file(path);
+            }
         }
     }
 }
@@ -325,7 +353,6 @@ async fn main() -> Result<()> {
             _ = gc.tick().fuse() => published.gc_structure(&dp, &mut structure_poller),
             up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
             (p, reply) = dp.select_next_some() => {
-                published.used(&p);
                 match published.resolve(&p) {
                     Some(_) => {
                         handle_subscribe_advertised(
@@ -377,8 +404,8 @@ async fn main() -> Result<()> {
                 Event::Subscribe(_, _) | Event::Unsubscribe(_, _) => (),
                 Event::Destroyed(id) => {
                     if let Some(pv) = published.published.remove(&id) {
-                        if let Some((_, ref mut id)) = published.resolve(&pv.path) {
-                            *id = None;
+                        if let Some(adf) = published.resolve(&pv.path) {
+                            adf.id = None;
                         }
                     }
                 }
