@@ -344,7 +344,7 @@ async fn main() -> Result<()> {
     let sysfs = Arc::new(opts.path);
     let file_poller = FilePoller::new(tx_file_updates);
     let mut gc = time::interval(Duration::from_secs(60));
-    let mut structure_poller = StructurePoller::new(tx_structure_updates);
+    let mut structure_poller = StructurePoller::new(sysfs.clone(), tx_structure_updates);
     let mut dp = publisher.publish_default(opts.base.clone())?;
     let mut published = Published::new(Paths::new(sysfs.clone(), opts.base.clone()));
     let mut updates = publisher.start_batch();

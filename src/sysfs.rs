@@ -178,11 +178,20 @@ impl Files {
         changes
     }
 
-    pub(crate) fn walk(&self, path: Arc<PathBuf>, max_depth: usize) -> Self {
-        self.walk_(path, max_depth, 0)
+    pub(crate) fn walk(&self, base: &Arc<PathBuf>, path: Arc<PathBuf>, max_depth: usize) -> Self {
+        self.walk_(base, path, max_depth, 0)
     }
 
-    fn walk_(&self, path: Arc<PathBuf>, max_depth: usize, depth: usize) -> Self {
+    fn walk_(
+        &self,
+        base: &Arc<PathBuf>,
+        path: Arc<PathBuf>,
+        max_depth: usize,
+        depth: usize,
+    ) -> Self {
+        if !path.starts_with(&**base) {
+            return self.clone();
+        }
         const S_IFMT: u32 = 61440;
         const S_IFREG: u32 = 32768;
         macro_rules! log {
@@ -205,19 +214,23 @@ impl Files {
                 "canonicalize {:?}, {}",
                 fs::canonicalize(&*path)
             );
-            let target = Arc::new(target);
-            let symlinks = self.symlinks.insert(path, target.clone()).0;
-            let t = Self {
-                symlinks,
-                ..self.clone()
-            };
-            t.walk_(target, max_depth, depth)
+            if !target.starts_with(&**base) {
+                self.clone()
+            } else {
+                let target = Arc::new(target);
+                let symlinks = self.symlinks.insert(path, target.clone()).0;
+                let t = Self {
+                    symlinks,
+                    ..self.clone()
+                };
+                t.walk_(base, target, max_depth, depth)
+            }
         } else if st.is_dir() {
             let mut t = self.clone();
             if depth < max_depth {
                 for ent in log!(self, &path, "readdir {:?}, {}", fs::read_dir(&*path)) {
                     let ent = log!(self, &path, "reading dir ent in {:?}, {}", ent);
-                    t = t.walk_(Arc::new(ent.path()), max_depth, depth + 1);
+                    t = t.walk_(base, Arc::new(ent.path()), max_depth, depth + 1);
                 }
             }
             let paths = t.paths.insert(path, FType::Directory).0;
@@ -409,13 +422,14 @@ impl FilePoller {
 }
 
 async fn poll_structure(
+    base: Arc<PathBuf>,
     path: Arc<PathBuf>,
     updates: UnboundedSender<StructureUpdate>,
     first: oneshot::Sender<Option<StructureUpdate>>,
     mut stop: oneshot::Receiver<()>,
 ) {
     const MAX_SKIP: u8 = 120;
-    let mut files = task::block_in_place(|| Files::empty().walk(path.clone(), 2));
+    let mut files = task::block_in_place(|| Files::empty().walk(&base, path.clone(), 2));
     let _ = first.send(Some(StructureUpdate {
         current: files.clone(),
         previous: Files::empty(),
@@ -431,7 +445,7 @@ async fn poll_structure(
                     skipped += 1;
                 } else {
                     skipped = 0;
-                    let current = task::block_in_place(|| Files::walk(&files, path.clone(), 2));
+                    let current = task::block_in_place(|| Files::walk(&files, &base, path.clone(), 2));
                     let previous = files.clone();
                     let changes = previous.diff(&current);
                     files = current.clone();
@@ -464,6 +478,7 @@ pub(crate) struct StructurePoller(UnboundedSender<StructureReq>);
 
 impl StructurePoller {
     async fn run(
+        base: Arc<PathBuf>,
         updates: UnboundedSender<StructureUpdate>,
         mut req: UnboundedReceiver<StructureReq>,
     ) {
@@ -483,16 +498,22 @@ impl StructurePoller {
                         by_path.insert(path.clone(), id);
                         let (tx_stop, rx_stop) = oneshot::channel();
                         by_id.insert(id, (path.clone(), tx_stop));
-                        task::spawn(poll_structure(path, updates.clone(), initial, rx_stop));
+                        task::spawn(poll_structure(
+                            base.clone(),
+                            path,
+                            updates.clone(),
+                            initial,
+                            rx_stop,
+                        ));
                     }
                 }
             }
         }
     }
 
-    pub(crate) fn new(updates: UnboundedSender<StructureUpdate>) -> Self {
+    pub(crate) fn new(base: Arc<PathBuf>, updates: UnboundedSender<StructureUpdate>) -> Self {
         let (tx, rx) = mpsc::unbounded();
-        task::spawn(Self::run(updates, rx));
+        task::spawn(Self::run(base, updates, rx));
         Self(tx)
     }
 
