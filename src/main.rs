@@ -10,7 +10,7 @@ use futures::{
     prelude::*,
     select_biased,
 };
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use log::warn;
 use netidx::{
     path::Path,
@@ -19,14 +19,18 @@ use netidx::{
 };
 use netidx_tools::ClientParams;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     mem,
+    ops::Bound,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use structopt::StructOpt;
 use sysfs::{StructureAction, StructureItem};
-use tokio;
+use tokio::{
+    self,
+    time::{self, Instant},
+};
 use triomphe::Arc;
 
 #[derive(StructOpt, Debug)]
@@ -60,8 +64,9 @@ struct PublishedFile {
 struct Published {
     published: FxHashMap<Id, PublishedFile>,
     by_fid: FxHashMap<Fid, Id>,
-    advertised: FxHashMap<Path, (Arc<PathBuf>, Option<Id>)>,
+    advertised: BTreeMap<Path, (Arc<PathBuf>, Option<Id>)>,
     aliased: FxHashMap<Path, Path>,
+    used: FxHashMap<Path, Instant>,
     paths: Paths,
 }
 
@@ -70,8 +75,9 @@ impl Published {
         Self {
             published: HashMap::default(),
             by_fid: HashMap::default(),
-            advertised: HashMap::default(),
+            advertised: BTreeMap::default(),
             aliased: HashMap::default(),
+            used: HashMap::default(),
             paths,
         }
     }
@@ -200,6 +206,62 @@ impl Published {
             }
         }
     }
+
+    fn used(&mut self, path: &Path) {
+        let base = Path::basename(&path).unwrap_or_else(|| "/");
+        match self.used.get_mut(base) {
+            Some(i) => {
+                *i = Instant::now();
+            }
+            None => {
+                self.used
+                    .insert(Path::from(String::from(base)), Instant::now());
+            }
+        }
+    }
+
+    fn advertised_children<'a, 'b: 'a>(
+        advertised: &'a BTreeMap<Path, (Arc<PathBuf>, Option<Id>)>,
+        base: &'b Path,
+    ) -> impl Iterator<Item = (&'a Path, &'a (Arc<PathBuf>, Option<Id>))> {
+        advertised
+            .range::<Path, (Bound<&Path>, Bound<&Path>)>((Bound::Included(base), Bound::Unbounded))
+            .take_while(|(p, _)| Path::is_parent(base, p))
+    }
+
+    fn gc_structure(&mut self, dp: &DefaultHandle, structure_poller: &mut StructurePoller) {
+        const TIMEOUT: Duration = Duration::from_secs(60);
+        let mut to_remove: FxHashSet<Path> = HashSet::default();
+        let mut stopped: FxHashSet<Path> = HashSet::default();
+        let used = &mut self.used;
+        let advertised = &mut self.advertised;
+        used.retain(|path, last| {
+            last.elapsed() < TIMEOUT || {
+                let published =
+                    Self::advertised_children(advertised, path).any(|(_, (_, id))| id.is_some());
+                published || {
+                    to_remove.extend(
+                        Self::advertised_children(advertised, path).map(|(p, _)| p.clone()),
+                    );
+                    false
+                }
+            }
+        });
+        for path in to_remove {
+            let base = Path::basename(&path).unwrap_or("/");
+            if !stopped.contains(base) {
+                let path = Path::from(String::from(base));
+                if let Some(fspath) = self.paths.fs_path(&path) {
+                    if let Err(e) = structure_poller.stop_by_path(Arc::new(fspath)) {
+                        warn!("failed to stop polling directory {}, {}", path, e)
+                    }
+                    stopped.insert(path);
+                }
+            }
+            dp.remove_advertisement(&path);
+            advertised.remove(&path);
+        }
+    }
 }
 
 async fn handle_subscribe_advertised(
@@ -256,45 +318,50 @@ async fn main() -> Result<()> {
     let mut rx_file_updates = Batched::new(rx_file_updates, 10_000);
     let sysfs = Arc::new(opts.sysfs);
     let file_poller = FilePoller::new(tx_file_updates);
+    let mut gc = time::interval(Duration::from_secs(60));
     let mut structure_poller = StructurePoller::new(tx_structure_updates);
     let mut dp = publisher.publish_default(opts.base.clone())?;
     let mut published = Published::new(Paths::new(sysfs.clone(), opts.base.clone()));
     let mut updates = publisher.start_batch();
     loop {
         select_biased! {
+            _ = gc.tick().fuse() => published.gc_structure(&dp, &mut structure_poller),
             up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
-            (p, reply) = dp.select_next_some() => match published.resolve(&p) {
-                Some(_) => {
-                    handle_subscribe_advertised(
-                        &mut published,
-                        &publisher,
-                        &file_poller,
-                        &p,
-                        reply
-                    ).await
-                },
-                None => if let Some(mut fspath) = published.paths.fs_path(&p) {
-                    fspath.pop();
-                    let fspath = if fspath.starts_with(&*sysfs) {
-                        Arc::new(fspath)
-                    } else {
-                        sysfs.clone()
-                    };
-                    match structure_poller.start(fspath).await {
-                        Ok(None) => (), // already polling this and it doesn't exist
-                        Err(e) => warn!("failed to poll {}", e),
-                        Ok(Some(up)) => {
-                            published.advertise(&dp, up);
-                            handle_subscribe_advertised(
-                                &mut published,
-                                &publisher,
-                                &file_poller,
-                                &p,
-                                reply
-                            ).await
-                        },
-                    }
-                },
+            (p, reply) = dp.select_next_some() => {
+                published.used(&p);
+                match published.resolve(&p) {
+                    Some(_) => {
+                        handle_subscribe_advertised(
+                            &mut published,
+                            &publisher,
+                            &file_poller,
+                            &p,
+                            reply
+                        ).await
+                    },
+                    None => if let Some(mut fspath) = published.paths.fs_path(&p) {
+                        fspath.pop();
+                        let fspath = if fspath.starts_with(&*sysfs) {
+                            Arc::new(fspath)
+                        } else {
+                            sysfs.clone()
+                        };
+                        match structure_poller.start(fspath).await {
+                            Ok(None) => (), // already polling this and it doesn't exist
+                            Err(e) => warn!("failed to poll {}", e),
+                            Ok(Some(up)) => {
+                                published.advertise(&dp, up);
+                                handle_subscribe_advertised(
+                                    &mut published,
+                                    &publisher,
+                                    &file_poller,
+                                    &p,
+                                    reply
+                                ).await
+                            },
+                        }
+                    },
+                }
             },
             r = rx_file_updates.select_next_some() => match r {
                 BatchItem::InBatch((fid, v)) => match published.by_fid.get(&fid) {

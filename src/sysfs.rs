@@ -101,7 +101,7 @@ impl Files {
         }
     }
 
-    pub(crate) fn iter_children_no_pfx<F: FnMut(&std::path::Path, &FType)>(&self, base: &PathBuf, f: F) {
+    pub(crate) fn iter_children_no_pfx<F: FnMut(&std::path::Path, &FType)>(&self, base: &PathBuf, mut f: F) {
         let children = self
             .paths
             .range(
@@ -469,7 +469,8 @@ async fn poll_structure(
 
 enum StructureReq {
     StartPolling(Fid, Arc<PathBuf>, oneshot::Sender<Option<StructureUpdate>>),
-    StopPolling(Fid),
+    StopById(Fid),
+    StopByPath(Arc<PathBuf>),
 }
 
 pub(crate) struct StructurePoller(UnboundedSender<StructureReq>);
@@ -483,9 +484,14 @@ impl StructurePoller {
         let mut by_id: FxHashMap<Fid, (Arc<PathBuf>, oneshot::Sender<()>)> = HashMap::default();
         while let Some(r) = req.next().await {
             match r {
-                StructureReq::StopPolling(id) => {
+                StructureReq::StopById(id) => {
                     if let Some((path, _)) = by_id.remove(&id) {
                         by_path.remove(&path);
+                    }
+                }
+                StructureReq::StopByPath(path) => {
+                    if let Some(id) = by_path.remove(&path) {
+                        by_id.remove(&id);
                     }
                 }
                 StructureReq::StartPolling(id, path, initial) => {
@@ -521,8 +527,15 @@ impl StructurePoller {
         }
     }
 
-    pub(crate) fn stop(&mut self, id: Fid) -> Result<()> {
-        if let Err(_) = self.0.unbounded_send(StructureReq::StopPolling(id)) {
+    pub(crate) fn stop_by_id(&mut self, id: Fid) -> Result<()> {
+        if let Err(_) = self.0.unbounded_send(StructureReq::StopById(id)) {
+            bail!("structure poller is dead")
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stop_by_path(&mut self, path: Arc<PathBuf>) -> Result<()> {
+        if let Err(_) = self.0.unbounded_send(StructureReq::StopByPath(path)) {
             bail!("structure poller is dead")
         }
         Ok(())
