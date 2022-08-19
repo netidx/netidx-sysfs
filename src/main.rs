@@ -234,7 +234,7 @@ impl Published {
     }
 
     fn used_file(&mut self, path: &Path) {
-        let base = Path::basename(&path).unwrap_or_else(|| "/");
+        let base = Path::dirname(&path).unwrap_or_else(|| "/");
         match self.used.get_mut(base) {
             Some(i) => {
                 *i = Instant::now();
@@ -263,7 +263,7 @@ impl Published {
         const TIMEOUT: Duration = Duration::from_secs(60);
         let mut to_remove: FxHashSet<Path> = HashSet::default();
         let mut stopped: FxHashSet<Path> = HashSet::default();
-        let used = &mut self.used;
+        let used = dbg!(&mut self.used);
         let advertised = &mut self.advertised;
         used.retain(|path, last| {
             last.elapsed() < TIMEOUT || {
@@ -278,6 +278,7 @@ impl Published {
             }
         });
         for path in to_remove {
+            self.aliased.remove(&path);
             dp.remove_advertisement(&path);
             if let Some(adf) = advertised.remove(&path) {
                 let base = match adf.typ {
