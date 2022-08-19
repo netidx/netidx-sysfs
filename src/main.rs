@@ -59,9 +59,16 @@ struct PublishedFile {
 }
 
 #[derive(Debug)]
+enum AType {
+    File,
+    Directory,
+    Symlink { target: Path },
+}
+
+#[derive(Debug)]
 struct AdvertisedFile {
     fspath: Arc<PathBuf>,
-    typ: FType,
+    typ: AType,
     id: Option<Id>,
 }
 
@@ -69,7 +76,6 @@ struct Published {
     published: FxHashMap<Id, PublishedFile>,
     by_fid: FxHashMap<Fid, Id>,
     advertised: BTreeMap<Path, AdvertisedFile>,
-    aliased: FxHashMap<Path, Path>,
     used: FxHashMap<Path, Instant>,
     paths: Paths,
 }
@@ -80,16 +86,18 @@ impl Published {
             published: HashMap::default(),
             by_fid: HashMap::default(),
             advertised: BTreeMap::default(),
-            aliased: HashMap::default(),
             used: HashMap::default(),
             paths,
         }
     }
 
     fn resolve(&mut self, path: &Path) -> Option<&mut AdvertisedFile> {
-        let tgt = self.aliased.get(path).cloned();
-        match tgt {
-            Some(tgt) => self.resolve(&tgt),
+        let target: Option<Path> = self.advertised.get(path).and_then(|adf| match adf.typ {
+            AType::File | AType::Directory => None,
+            AType::Symlink { ref target } => Some(target.clone()),
+        });
+        match target {
+            Some(target) => self.resolve(&target),
             None => self.advertised.get_mut(path),
         }
     }
@@ -113,31 +121,6 @@ impl Published {
         ))
     }
 
-    fn add_file_link<T: AsRef<std::path::Path>, U: AsRef<std::path::Path>>(
-        &mut self,
-        dp: &DefaultHandle,
-        src: T,
-        tgt: U,
-    ) {
-        let (src, tgt) = match self.netidx_paths(src, tgt) {
-            Some((s, t)) => (s, t),
-            None => return,
-        };
-        if let Err(e) = dp.advertise(src.clone()) {
-            warn!("failed to advertise path {}, {}", src, e)
-        }
-        self.aliased.insert(src, tgt);
-    }
-
-    fn remove_file_link(&mut self, dp: &DefaultHandle, src: &Arc<PathBuf>) {
-        let src = match self.paths.netidx_path(&**src) {
-            Some(p) => p,
-            None => return,
-        };
-        dp.remove_advertisement(&src);
-        self.aliased.remove(&src);
-    }
-
     fn advertise(&mut self, dp: &DefaultHandle, update: StructureUpdate) {
         for up in update.changes {
             match &up.item {
@@ -151,7 +134,7 @@ impl Published {
                                 }
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
-                                    typ: FType::Directory,
+                                    typ: AType::Directory,
                                     id: None,
                                 };
                                 self.advertised.insert(path, adf);
@@ -169,7 +152,7 @@ impl Published {
                                 }
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
-                                    typ: FType::File,
+                                    typ: AType::File,
                                     id: None,
                                 };
                                 self.advertised.insert(path, adf);
@@ -181,7 +164,14 @@ impl Published {
                     StructureAction::Removed => match update.previous.resolve(&target) {
                         Err(e) => warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e),
                         Ok((target, typ)) => match typ {
-                            FType::File => self.remove_file_link(dp, &up.path),
+                            FType::File => {
+                                let src = match self.paths.netidx_path(&*up.path) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
+                                dp.remove_advertisement(&src);
+                                self.advertised.remove(&src);
+                            }
                             FType::Directory => {
                                 let (src_path, _) = match self.netidx_paths(&*up.path, target) {
                                     Some((s, t)) => (s, t),
@@ -192,7 +182,7 @@ impl Published {
                                     let p = p.as_os_str().to_string_lossy();
                                     let src_path = src_path.append(&p);
                                     dp.remove_advertisement(&src_path);
-                                    self.aliased.remove(&src_path);
+                                    self.advertised.remove(&src_path);
                                 })
                             }
                         },
@@ -200,7 +190,22 @@ impl Published {
                     StructureAction::Added => match update.current.resolve(&target) {
                         Err(e) => warn!("bad symlink {:?} -> {:?} {}", &up.path, &target, e),
                         Ok((target, typ)) => match typ {
-                            FType::File => self.add_file_link(dp, &*up.path, target),
+                            FType::File => {
+                                let (source, target) = match self.netidx_paths(&*up.path, &*target)
+                                {
+                                    Some((s, t)) => (s, t),
+                                    None => return,
+                                };
+                                if let Err(e) = dp.advertise(source.clone()) {
+                                    warn!("failed to advertise path {}, {}", source, e)
+                                }
+                                let adf = AdvertisedFile {
+                                    fspath: up.path.clone(),
+                                    typ: AType::Symlink { target },
+                                    id: None,
+                                };
+                                self.advertised.insert(source, adf);
+                            }
                             FType::Directory => {
                                 let (src_path, tgt_path) =
                                     match self.netidx_paths(&*up.path, target) {
@@ -212,18 +217,23 @@ impl Published {
                                 }
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
-                                    typ: FType::Directory,
+                                    typ: AType::Directory,
                                     id: None,
                                 };
                                 self.advertised.insert(src_path.clone(), adf);
                                 update.current.iter_children_no_pfx(target, |p, _| {
-                                    let p = p.as_os_str().to_string_lossy();
-                                    let src_path = src_path.append(&p);
-                                    let tgt_path = tgt_path.append(&p);
+                                    let s = p.as_os_str().to_string_lossy();
+                                    let src_path = src_path.append(&s);
+                                    let tgt_path = tgt_path.append(&s);
                                     if let Err(e) = dp.advertise(src_path.clone()) {
                                         warn!("failed to advertise {}, {}", src_path, e)
                                     }
-                                    self.aliased.insert(src_path, tgt_path);
+                                    let adf = AdvertisedFile {
+                                        fspath: Arc::new(up.path.join(p)),
+                                        typ: AType::Symlink { target: tgt_path },
+                                        id: None,
+                                    };
+                                    self.advertised.insert(src_path, adf);
                                 })
                             }
                         },
@@ -278,12 +288,11 @@ impl Published {
             }
         });
         for path in to_remove {
-            self.aliased.remove(&path);
             dp.remove_advertisement(&path);
             if let Some(adf) = advertised.remove(&path) {
                 let base = match adf.typ {
-                    FType::Directory => path.clone(),
-                    FType::File => {
+                    AType::Directory => path.clone(),
+                    AType::Symlink { .. } | AType::File => {
                         let base = Path::basename(&path).unwrap_or("/");
                         stopped
                             .get(base)
@@ -313,8 +322,9 @@ async fn handle_subscribe_advertised(
 ) {
     if let Some(adf) = published.resolve(path) {
         match adf.typ {
-            FType::Directory => published.used_directory(path),
-            FType::File => {
+            AType::Symlink { .. } => unreachable!(), // resolve should never return a symlink
+            AType::Directory => published.used_directory(path),
+            AType::File => {
                 match adf.id {
                     Some(id) => match publisher.alias(id, path.clone()) {
                         Ok(()) => (),
@@ -373,7 +383,8 @@ async fn main() -> Result<()> {
             up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
             (p, reply) = dp.select_next_some() => {
                 match published.resolve(&p) {
-                    Some(AdvertisedFile {typ: FType::File, ..}) => {
+                    Some(AdvertisedFile { typ: AType::Symlink { .. }, .. }) => unreachable!(),
+                    Some(AdvertisedFile { typ: AType::File, .. }) => {
                         handle_subscribe_advertised(
                             &mut published,
                             &publisher,
@@ -382,7 +393,7 @@ async fn main() -> Result<()> {
                             reply
                         ).await
                     },
-                    r@ (None | Some(AdvertisedFile {typ: FType::Directory, ..})) => {
+                    r@ (None | Some(AdvertisedFile {typ: AType::Directory, ..})) => {
                         let dir = r.is_some();
                         if let Some(mut fspath) = published.paths.fs_path(&p) {
                             let fspath = if dir {
