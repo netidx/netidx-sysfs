@@ -18,7 +18,7 @@ use netidx_tools::ClientParams;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     mem,
-    ops::Bound,
+    ops::{Bound, Deref, DerefMut},
     path::PathBuf,
     time::Duration,
 };
@@ -58,7 +58,7 @@ struct PublishedFile {
     val: Val,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum AType {
     File,
     Directory,
@@ -72,10 +72,58 @@ struct AdvertisedFile {
     id: Option<Id>,
 }
 
+struct Advertised(BTreeMap<Path, AdvertisedFile>);
+
+impl Deref for Advertised {
+    type Target = BTreeMap<Path, AdvertisedFile>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Advertised {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Advertised {
+    fn new() -> Self {
+        Advertised(BTreeMap::default())
+    }
+
+    fn resolve_mut(&mut self, path: &Path) -> Option<&mut AdvertisedFile> {
+        let target: Option<Path> = self.get(path).and_then(|adf| match adf.typ {
+            AType::File | AType::Directory => None,
+            AType::Symlink { ref target } => Some(target.clone()),
+        });
+        match target {
+            Some(target) => self.resolve_mut(&target),
+            None => self.get_mut(path),
+        }
+    }
+
+    fn resolve(&self, path: &Path) -> Option<&AdvertisedFile> {
+        self.get(path).and_then(|adf| match adf.typ {
+            AType::File | AType::Directory => Some(adf),
+            AType::Symlink { ref target } => self.resolve(target),
+        })
+    }
+
+    fn children<'a, 'b: 'a>(
+        &'a self,
+        base: &'b Path,
+    ) -> impl Iterator<Item = (&'a Path, &'a AdvertisedFile)> {
+        self.range::<Path, (Bound<&Path>, Bound<&Path>)>((Bound::Included(base), Bound::Unbounded))
+            .take_while(|(p, _)| Path::is_parent(base, p))
+    }
+}
+
 struct Published {
     published: FxHashMap<Id, PublishedFile>,
     by_fid: FxHashMap<Fid, Id>,
-    advertised: BTreeMap<Path, AdvertisedFile>,
+    advertised: Advertised,
     used: FxHashMap<Path, Instant>,
     paths: Paths,
 }
@@ -85,20 +133,9 @@ impl Published {
         Self {
             published: HashMap::default(),
             by_fid: HashMap::default(),
-            advertised: BTreeMap::default(),
+            advertised: Advertised::new(),
             used: HashMap::default(),
             paths,
-        }
-    }
-
-    fn resolve(&mut self, path: &Path) -> Option<&mut AdvertisedFile> {
-        let target: Option<Path> = self.advertised.get(path).and_then(|adf| match adf.typ {
-            AType::File | AType::Directory => None,
-            AType::Symlink { ref target } => Some(target.clone()),
-        });
-        match target {
-            Some(target) => self.resolve(&target),
-            None => self.advertised.get_mut(path),
         }
     }
 
@@ -260,34 +297,32 @@ impl Published {
         *self.used.entry(path.clone()).or_insert_with(Instant::now) = Instant::now();
     }
 
-    fn advertised_children<'a, 'b: 'a>(
-        advertised: &'a BTreeMap<Path, AdvertisedFile>,
-        base: &'b Path,
-    ) -> impl Iterator<Item = (&'a Path, &'a AdvertisedFile)> {
-        advertised
-            .range::<Path, (Bound<&Path>, Bound<&Path>)>((Bound::Included(base), Bound::Unbounded))
-            .take_while(|(p, _)| Path::is_parent(base, p))
-    }
-
     fn gc_structure(&mut self, dp: &DefaultHandle, structure_poller: &mut StructurePoller) {
+        dbg!("gc structure");
         const TIMEOUT: Duration = Duration::from_secs(60);
         let mut to_remove: FxHashSet<Path> = HashSet::default();
         let mut stopped: FxHashSet<Path> = HashSet::default();
-        let used = dbg!(&mut self.used);
+        let used = &mut self.used;
         let advertised = &mut self.advertised;
         used.retain(|path, last| {
+            dbg!(path);
             last.elapsed() < TIMEOUT || {
                 let published =
-                    Self::advertised_children(advertised, path).any(|(_, adf)| adf.id.is_some());
+                    advertised
+                        .children(path)
+                        .any(|(path, _)| match advertised.resolve(path) {
+                            Some(adf) => adf.id.is_some(),
+                            None => false,
+                        });
                 published || {
-                    to_remove.extend(
-                        Self::advertised_children(advertised, path).map(|(p, _)| p.clone()),
-                    );
+                    dbg!(path);
+                    to_remove.extend(advertised.children(path).map(|(p, _)| p.clone()));
                     false
                 }
             }
         });
         for path in to_remove {
+            dbg!(&path);
             dp.remove_advertisement(&path);
             if let Some(adf) = advertised.remove(&path) {
                 let base = match adf.typ {
@@ -320,7 +355,7 @@ async fn handle_subscribe_advertised(
     path: &Path,
     reply: oneshot::Sender<()>,
 ) {
-    if let Some(adf) = published.resolve(path) {
+    if let Some(adf) = published.advertised.resolve_mut(path) {
         match adf.typ {
             AType::Symlink { .. } => unreachable!(), // resolve should never return a symlink
             AType::Directory => published.used_directory(path),
@@ -372,7 +407,7 @@ async fn main() -> Result<()> {
     let mut rx_file_updates = Batched::new(rx_file_updates, 10_000);
     let sysfs = Arc::new(opts.path);
     let file_poller = FilePoller::new(tx_file_updates);
-    let mut gc = time::interval(Duration::from_secs(60));
+    let mut gc = time::interval(Duration::from_secs(10));
     let mut structure_poller = StructurePoller::new(sysfs.clone(), tx_structure_updates);
     let mut dp = publisher.publish_default(opts.base.clone())?;
     let mut published = Published::new(Paths::new(sysfs.clone(), opts.base.clone()));
@@ -382,7 +417,7 @@ async fn main() -> Result<()> {
             _ = gc.tick().fuse() => published.gc_structure(&dp, &mut structure_poller),
             up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
             (p, reply) = dp.select_next_some() => {
-                match published.resolve(&p) {
+                match published.advertised.resolve(&p) {
                     Some(AdvertisedFile { typ: AType::Symlink { .. }, .. }) => unreachable!(),
                     Some(AdvertisedFile { typ: AType::File, .. }) => {
                         handle_subscribe_advertised(
@@ -441,7 +476,7 @@ async fn main() -> Result<()> {
                 Event::Subscribe(_, _) | Event::Unsubscribe(_, _) => (),
                 Event::Destroyed(id) => {
                     if let Some(pv) = published.published.remove(&id) {
-                        if let Some(adf) = published.resolve(&pv.path) {
+                        if let Some(adf) = published.advertised.resolve_mut(&pv.path) {
                             adf.id = None;
                         }
                     }
