@@ -113,10 +113,30 @@ impl Advertised {
 
     fn children<'a, 'b: 'a>(
         &'a self,
-        base: &'b Path,
+        base: &'b str,
     ) -> impl Iterator<Item = (&'a Path, &'a AdvertisedFile)> {
-        self.range::<Path, (Bound<&Path>, Bound<&Path>)>((Bound::Included(base), Bound::Unbounded))
+        self.range::<str, (Bound<&str>, Bound<&str>)>((Bound::Included(base), Bound::Unbounded))
             .take_while(|(p, _)| Path::is_parent(base, p))
+    }
+
+    fn is_leaf<P: AsRef<str>>(&self, path: P) -> bool {
+        let mut ch = self.children(path.as_ref());
+        ch.next().is_none() || ch.next().is_none()
+    }
+
+    fn is_leaf_dir<P: AsRef<str>>(&self, path: P) -> bool {
+        let mut ch = self.children(path.as_ref());
+        match ch.next() {
+            None => false,
+            Some((_, AdvertisedFile {typ: AType::Directory, ..})) => ch.next().is_none(),
+            Some(_) => false,
+        }
+    }
+}
+
+fn advertise(dp: &DefaultHandle, path: Path) {
+    if let Err(e) = dp.advertise(path.clone()) {
+        warn!("failed to advertise path {}, {}", path, e)
     }
 }
 
@@ -139,10 +159,30 @@ impl Published {
         }
     }
 
-    fn remove(&mut self, path: &Path) {
+    fn remove(&mut self, dp: &DefaultHandle, path: &Path) {
         if let Some(AdvertisedFile { id: Some(id), .. }) = self.advertised.remove(path) {
             if let Some(pf) = self.published.remove(&id) {
                 self.by_fid.remove(&pf.fid);
+            }
+        }
+        self.maybe_add_dir_advertisement(dp, path)
+    }
+
+    fn maybe_add_parent_dir_advertisement(&mut self, dp: &DefaultHandle, path: &Path) {
+        if let Some(parent) = Path::dirname(path) {
+            if self.advertised.is_leaf_dir(parent) {
+                advertise(dp, Path::from(String::from(parent)));
+            }
+        }
+    }
+
+    // we advertise directories as values only if they have no children
+    fn maybe_remove_parent_dir_advertisement(&mut self, dp: &DefaultHandle, path: &Path) {
+        if let Some(parent) = Path::dirname(&path) {
+            if !self.advertised.is_leaf_dir(parent) {
+                if let Some((p, _)) = self.advertised.get_key_value(parent) {
+                    dp.remove_advertisement(p);
+                }
             }
         }
     }
@@ -164,17 +204,17 @@ impl Published {
                 StructureItem::Directory => {
                     if let Some(path) = self.paths.netidx_path(&*up.path) {
                         match up.action {
-                            StructureAction::Removed => self.remove(&path),
+                            StructureAction::Removed => self.remove(dp, &path),
                             StructureAction::Added => {
-                                if let Err(e) = dp.advertise(path.clone()) {
-                                    warn!("failed to advertise path {}, {}", path, e)
-                                }
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
                                     typ: AType::Directory,
                                     id: None,
                                 };
-                                self.advertised.insert(path, adf);
+                                self.advertised.insert(path.clone(), adf);
+                                if self.advertised.is_leaf_dir(&path) {
+                                    advertise(dp, path.clone());
+                                }
                             }
                         }
                     }
@@ -182,17 +222,16 @@ impl Published {
                 StructureItem::File => {
                     if let Some(path) = self.paths.netidx_path(&*up.path) {
                         match up.action {
-                            StructureAction::Removed => self.remove(&path),
+                            StructureAction::Removed => self.remove(dp, &path),
                             StructureAction::Added => {
-                                if let Err(e) = dp.advertise(path.clone()) {
-                                    warn!("failed to advertise path {}, {}", path, e)
-                                }
+                                advertise(dp, path.clone());
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
                                     typ: AType::File,
                                     id: None,
                                 };
-                                self.advertised.insert(path, adf);
+                                self.advertised.insert(path.clone(), adf);
+                                self.remove_parent_dir_advertisement(dp, &path);
                             }
                         }
                     }
@@ -208,6 +247,7 @@ impl Published {
                                 };
                                 dp.remove_advertisement(&src);
                                 self.advertised.remove(&src);
+                                self.maybe_add_parent_dir_advertisement(dp, &src);
                             }
                             FType::Directory => {
                                 let (src_path, _) = match self.netidx_paths(&*up.path, target) {
@@ -220,7 +260,8 @@ impl Published {
                                     let src_path = src_path.append(&p);
                                     dp.remove_advertisement(&src_path);
                                     self.advertised.remove(&src_path);
-                                })
+                                });
+                                self.maybe_add_parent_dir_advertisement(dp, &src_path);
                             }
                         },
                     },
@@ -233,15 +274,14 @@ impl Published {
                                     Some((s, t)) => (s, t),
                                     None => return,
                                 };
-                                if let Err(e) = dp.advertise(source.clone()) {
-                                    warn!("failed to advertise path {}, {}", source, e)
-                                }
+                                advertise(dp, source.clone());
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
                                     typ: AType::Symlink { target },
                                     id: None,
                                 };
-                                self.advertised.insert(source, adf);
+                                self.advertised.insert(source.clone(), adf);
+                                self.maybe_remove_parent_dir_advertisement(dp, &source);
                             }
                             FType::Directory => {
                                 let (src_path, tgt_path) =
@@ -249,9 +289,6 @@ impl Published {
                                         Some((s, t)) => (s, t),
                                         None => continue,
                                     };
-                                if let Err(e) = dp.advertise(src_path.clone()) {
-                                    warn!("failed to advertise path {}, {}", src_path, e)
-                                }
                                 let adf = AdvertisedFile {
                                     fspath: up.path.clone(),
                                     typ: AType::Directory,
@@ -262,16 +299,18 @@ impl Published {
                                     let s = p.as_os_str().to_string_lossy();
                                     let src_path = src_path.append(&s);
                                     let tgt_path = tgt_path.append(&s);
-                                    if let Err(e) = dp.advertise(src_path.clone()) {
-                                        warn!("failed to advertise {}, {}", src_path, e)
-                                    }
+                                    advertise(dp, src_path.clone());
                                     let adf = AdvertisedFile {
                                         fspath: Arc::new(up.path.join(p)),
                                         typ: AType::Symlink { target: tgt_path },
                                         id: None,
                                     };
                                     self.advertised.insert(src_path, adf);
-                                })
+                                });
+                                if self.advertised.is_leaf_dir(&src_path) {
+                                    advertise(dp, src_path.clone());
+                                }
+                                self.maybe_remove_parent_dir_advertisement(dp, &src_path);
                             }
                         },
                     },
@@ -344,6 +383,7 @@ impl Published {
                     }
                 }
             }
+            self.maybe_add_parent_dir_advertisement(dp, &path);
         }
     }
 }
