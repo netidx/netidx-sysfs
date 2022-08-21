@@ -119,16 +119,17 @@ impl Advertised {
             .take_while(|(p, _)| Path::is_parent(base, p))
     }
 
-    fn is_leaf<P: AsRef<str>>(&self, path: P) -> bool {
-        let mut ch = self.children(path.as_ref());
-        ch.next().is_none() || ch.next().is_none()
-    }
-
     fn is_leaf_dir<P: AsRef<str>>(&self, path: P) -> bool {
         let mut ch = self.children(path.as_ref());
         match ch.next() {
             None => false,
-            Some((_, AdvertisedFile {typ: AType::Directory, ..})) => ch.next().is_none(),
+            Some((
+                _,
+                AdvertisedFile {
+                    typ: AType::Directory,
+                    ..
+                },
+            )) => ch.next().is_none(),
             Some(_) => false,
         }
     }
@@ -165,7 +166,7 @@ impl Published {
                 self.by_fid.remove(&pf.fid);
             }
         }
-        self.maybe_add_dir_advertisement(dp, path)
+        self.maybe_add_parent_dir_advertisement(dp, path)
     }
 
     fn maybe_add_parent_dir_advertisement(&mut self, dp: &DefaultHandle, path: &Path) {
@@ -231,7 +232,7 @@ impl Published {
                                     id: None,
                                 };
                                 self.advertised.insert(path.clone(), adf);
-                                self.remove_parent_dir_advertisement(dp, &path);
+                                self.maybe_remove_parent_dir_advertisement(dp, &path);
                             }
                         }
                     }
@@ -341,29 +342,31 @@ impl Published {
         const TIMEOUT: Duration = Duration::from_secs(60);
         let mut to_remove: FxHashSet<Path> = HashSet::default();
         let mut stopped: FxHashSet<Path> = HashSet::default();
-        let used = &mut self.used;
-        let advertised = &mut self.advertised;
-        used.retain(|path, last| {
-            dbg!(path);
-            last.elapsed() < TIMEOUT || {
-                let published =
-                    advertised
-                        .children(path)
-                        .any(|(path, _)| match advertised.resolve(path) {
-                            Some(adf) => adf.id.is_some(),
-                            None => false,
-                        });
-                published || {
-                    dbg!(path);
-                    to_remove.extend(advertised.children(path).map(|(p, _)| p.clone()));
-                    false
+        {
+            let used = &mut self.used;
+            let advertised = &mut self.advertised;
+            used.retain(|path, last| {
+                dbg!(path);
+                last.elapsed() < TIMEOUT || {
+                    let published =
+                        advertised
+                            .children(path)
+                            .any(|(path, _)| match advertised.resolve(path) {
+                                Some(adf) => adf.id.is_some(),
+                                None => false,
+                            });
+                    published || {
+                        dbg!(path);
+                        to_remove.extend(advertised.children(path).map(|(p, _)| p.clone()));
+                        false
+                    }
                 }
-            }
-        });
+            });
+        }
         for path in to_remove {
             dbg!(&path);
             dp.remove_advertisement(&path);
-            if let Some(adf) = advertised.remove(&path) {
+            if let Some(adf) = self.advertised.remove(&path) {
                 let base = match adf.typ {
                     AType::Directory => path.clone(),
                     AType::Symlink { .. } | AType::File => {
