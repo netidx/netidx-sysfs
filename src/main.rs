@@ -468,6 +468,7 @@ async fn main() -> Result<()> {
                 match published.advertised.resolve(&p) {
                     Some(AdvertisedFile { typ: AType::Symlink { .. }, .. }) => unreachable!(),
                     Some(AdvertisedFile { typ: AType::File, .. }) => {
+                        dbg!("subscribe advertise");
                         handle_subscribe_advertised(
                             &mut published,
                             &publisher,
@@ -489,11 +490,13 @@ async fn main() -> Result<()> {
                                     sysfs.clone()
                                 }
                             };
+                            dbg!("structure poll start {}", &fspath);
                             match structure_poller.start(fspath).await {
                                 Ok(None) => (), // already polling this
                                 Err(e) => warn!("failed to poll {}", e),
                                 Ok(Some(up)) => {
                                     published.advertise(&dp, up);
+                                    dbg!("subscribe advertise");
                                     handle_subscribe_advertised(
                                         &mut published,
                                         &publisher,
@@ -517,6 +520,7 @@ async fn main() -> Result<()> {
                 }
                 BatchItem::EndBatch => {
                     let up = mem::replace(&mut updates, publisher.start_batch());
+                    dbg!("commit batch");
                     up.commit(timeout).await
                 }
             },

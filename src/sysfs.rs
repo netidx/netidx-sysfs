@@ -290,10 +290,11 @@ pub(crate) async fn poll_file(
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
     const MAX_SKIP: u16 = 300;
+    const WAIT: Duration = Duration::from_secs(2);
     let mut prev = vec![0; SZ];
     let mut buf = vec![0; SZ];
     let mut first = Some(first);
-    let mut send = |v: Value| -> Result<()> {
+    let send = |first: &mut Option<oneshot::Sender<Value>>, v: Value| -> Result<()> {
         match first.take() {
             None => Ok(updates.unbounded_send((id, v))?),
             Some(first) => {
@@ -304,7 +305,11 @@ pub(crate) async fn poll_file(
     };
     let mut skip: u16 = 0;
     'main: loop {
-        let (pos, buf_) = read_file(&file, buf).await?;
+        let (pos, buf_) = if first.is_some() {
+            time::timeout(WAIT, read_file(&file, buf)).await??
+        } else {
+            read_file(&file, buf).await?
+        };
         buf = buf_;
         if prev.len() >= pos && &buf[0..pos] == &prev[0..pos] {
             // backoff polling up to max_skip clocks if we find the
@@ -317,12 +322,15 @@ pub(crate) async fn poll_file(
             }
             prev.copy_from_slice(&buf);
             match std::str::from_utf8(&buf[0..pos]) {
-                Err(_) => send(Value::from(Bytes::copy_from_slice(&buf[0..pos])))?,
+                Err(_) => send(
+                    &mut first,
+                    Value::from(Bytes::copy_from_slice(&buf[0..pos])),
+                )?,
                 Ok(data) => match data.trim().parse::<i64>() {
-                    Ok(i) => send(Value::from(i))?,
+                    Ok(i) => send(&mut first, Value::from(i))?,
                     Err(_) => match data.trim().parse::<f64>() {
-                        Ok(f) => send(Value::from(f))?,
-                        Err(_) => send(Value::from(String::from(data.trim())))?,
+                        Ok(f) => send(&mut first, Value::from(f))?,
+                        Err(_) => send(&mut first, Value::from(String::from(data.trim())))?,
                     },
                 },
             }
@@ -433,7 +441,23 @@ async fn poll_structure(
     mut stop: oneshot::Receiver<()>,
 ) {
     const MAX_SKIP: u8 = 120;
-    let mut files = task::block_in_place(|| Files::empty().walk(&base, path.clone(), 1));
+    const WAIT: Duration = Duration::from_secs(5);
+    let join = task::spawn_blocking({
+        let base = base.clone();
+        let path = path.clone();
+        move || Files::empty().walk(&base, path, 1)
+    });
+    let mut files = match time::timeout(WAIT, join).await {
+        Ok(Ok(files)) => files,
+        Ok(Err(e)) => {
+            warn!("failed to join poll task {:?}, {}", path, e);
+            return;
+        }
+        Err(e) => {
+            warn!("timeout polling {:?}, {}", path, e);
+            return;
+        }
+    };
     let _ = first.send(Some(StructureUpdate {
         current: files.clone(),
         previous: Files::empty(),
