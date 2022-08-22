@@ -172,7 +172,7 @@ impl Published {
     fn maybe_add_parent_dir_advertisement(&mut self, dp: &DefaultHandle, path: &Path) {
         if let Some(parent) = Path::dirname(path) {
             if self.advertised.is_leaf_dir(parent) {
-                advertise(dp, Path::from(String::from(parent)));
+                advertise(dp, Path::from_str(parent));
             }
         }
     }
@@ -327,8 +327,7 @@ impl Published {
                 *i = Instant::now();
             }
             None => {
-                self.used
-                    .insert(Path::from(String::from(base)), Instant::now());
+                self.used.insert(Path::from_str(base), Instant::now());
             }
         }
     }
@@ -364,29 +363,35 @@ impl Published {
             });
         }
         for path in to_remove {
-            dbg!(&path);
-            dp.remove_advertisement(&path);
-            if let Some(adf) = self.advertised.remove(&path) {
-                let base = match adf.typ {
-                    AType::Directory => path.clone(),
-                    AType::Symlink { .. } | AType::File => {
-                        let base = Path::basename(&path).unwrap_or("/");
-                        stopped
-                            .get(base)
-                            .cloned()
-                            .unwrap_or_else(|| Path::from(String::from(base)))
-                    }
-                };
-                if !stopped.contains(&base) {
-                    if let Some(fspath) = self.paths.fs_path(&base) {
-                        if let Err(e) = structure_poller.stop_by_path(Arc::new(fspath)) {
-                            warn!("failed to stop polling directory {}, {}", path, e)
+            // if the path's immediate parent is still used then we
+            // don't remove it because that would desync the poll.
+            if !Path::dirname(&path)
+                .map(|p| self.used.contains_key(p))
+                .unwrap_or(false)
+            {
+                dp.remove_advertisement(&path);
+                if let Some(adf) = self.advertised.remove(&path) {
+                    let base = match adf.typ {
+                        AType::Directory => path.clone(),
+                        AType::Symlink { .. } | AType::File => {
+                            let base = Path::basename(&path).unwrap_or("/");
+                            stopped
+                                .get(base)
+                                .cloned()
+                                .unwrap_or_else(|| Path::from_str(base))
                         }
-                        stopped.insert(base);
+                    };
+                    if !stopped.contains(&base) {
+                        if let Some(fspath) = self.paths.fs_path(&base) {
+                            if let Err(e) = structure_poller.stop_by_path(Arc::new(fspath)) {
+                                warn!("failed to stop polling directory {}, {}", path, e)
+                            }
+                            stopped.insert(base);
+                        }
                     }
                 }
+                self.maybe_add_parent_dir_advertisement(dp, &path);
             }
-            self.maybe_add_parent_dir_advertisement(dp, &path);
         }
     }
 }
