@@ -337,7 +337,6 @@ impl Published {
     }
 
     fn gc_structure(&mut self, structure_poller: &mut StructurePoller) {
-        dbg!("gc_structure");
         const TIMEOUT: Duration = Duration::from_secs(60);
         let mut to_remove: Vec<Path> = Vec::new();
         let used = &mut self.used;
@@ -384,12 +383,11 @@ async fn handle_subscribe_advertised(
                         Ok(()) => (),
                         Err(e) => warn!("failed to alias {}, {}", path, e),
                     },
-                    None => match file_poller.start(dbg!(adf.fspath.clone())).await {
+                    None => match file_poller.start(adf.fspath.clone()).await {
                         Err(e) => warn!("polling file {} failed {}", path, e),
                         Ok((fid, v)) => {
-                            dbg!((fid, &v));
                             let flags = PublishFlags::DESTROY_ON_IDLE;
-                            match publisher.publish_with_flags(flags, dbg!(path.clone()), v) {
+                            match publisher.publish_with_flags(flags, path.clone(), v) {
                                 Err(e) => warn!("failed to publish {}, {}", path, e),
                                 Ok(val) => {
                                     let vid = val.id();
@@ -440,7 +438,6 @@ async fn main() -> Result<()> {
                 match published.advertised.resolve(&p) {
                     Some(AdvertisedFile { typ: AType::Symlink { .. }, .. }) => unreachable!(),
                     Some(AdvertisedFile { typ: AType::File, .. }) => {
-                        dbg!(&p);
                         handle_subscribe_advertised(
                             &mut published,
                             &publisher,
@@ -462,13 +459,11 @@ async fn main() -> Result<()> {
                                     sysfs.clone()
                                 }
                             };
-                            dbg!(&fspath);
                             match structure_poller.start(fspath).await {
                                 Ok(None) => (), // already polling this
                                 Err(e) => warn!("failed to poll {}", e),
                                 Ok(Some(up)) => {
                                     published.advertise(&dp, up);
-                                    dbg!(&p);
                                     handle_subscribe_advertised(
                                         &mut published,
                                         &publisher,
@@ -492,7 +487,6 @@ async fn main() -> Result<()> {
                 }
                 BatchItem::EndBatch => {
                     let up = mem::replace(&mut updates, publisher.start_batch());
-                    dbg!("commit");
                     up.commit(timeout).await
                 }
             },

@@ -259,18 +259,14 @@ const SZ: usize = 64;
 
 async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)> {
     const MAX: usize = 512;
-    dbg!(&file);
     let fd = File::open(file).await?;
-    dbg!(&file);
     let mut pos = 0;
     loop {
         let len = buf.len();
         if len - pos < SZ && len < MAX {
             buf.resize(len * 2, 0);
         }
-        dbg!(pos);
         let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
-        dbg!(pos);
         let read = read?;
         if read == 0 {
             buf = res.into_inner();
@@ -293,7 +289,6 @@ pub(crate) async fn poll_file(
     mut clock: broadcast::Receiver<()>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
-    dbg!(&file);
     const MAX_SKIP: u16 = 300;
     const WAIT: Duration = Duration::from_secs(2);
     let mut prev = vec![0; SZ];
@@ -518,6 +513,7 @@ async fn poll_structure(
                     current,
                     changes,
                 });
+                info!("structure poll of {:?} shutting down as requested", &path);
                 break
             },
         }
@@ -525,8 +521,8 @@ async fn poll_structure(
 }
 
 enum StructureReq {
-    StartPolling(Fid, Arc<PathBuf>, oneshot::Sender<Option<StructureUpdate>>),
-    StopByPath(Arc<PathBuf>),
+    Start(Arc<PathBuf>, oneshot::Sender<Option<StructureUpdate>>),
+    Stop(Arc<PathBuf>),
 }
 
 pub(crate) struct StructurePoller(UnboundedSender<StructureReq>);
@@ -537,24 +533,23 @@ impl StructurePoller {
         updates: UnboundedSender<StructureUpdate>,
         mut req: UnboundedReceiver<StructureReq>,
     ) {
-        let mut by_path: FxHashMap<Arc<PathBuf>, Fid> = HashMap::default();
-        let mut by_id: FxHashMap<Fid, (Arc<PathBuf>, oneshot::Sender<()>)> = HashMap::default();
+        let mut polling: FxHashMap<Arc<PathBuf>, oneshot::Sender<()>> = HashMap::default();
         while let Some(r) = req.next().await {
             match r {
-                StructureReq::StopByPath(path) => {
+                StructureReq::Stop(path) => {
                     info!("stop polling {:?}", path);
-                    if let Some(id) = by_path.remove(&path) {
-                        by_id.remove(&id);
+                    if let Some(stop) = polling.remove(&path) {
+                        let _ = stop.send(());
                     }
+                    dbg!(polling.keys());
                 }
-                StructureReq::StartPolling(id, path, initial) => {
-                    if by_path.contains_key(&path) {
+                StructureReq::Start(path, initial) => {
+                    if polling.contains_key(&path) {
                         let _ = initial.send(None);
                     } else {
                         info!("start polling {:?}", path);
-                        by_path.insert(path.clone(), id);
                         let (tx_stop, rx_stop) = oneshot::channel();
-                        by_id.insert(id, (path.clone(), tx_stop));
+                        polling.insert(path.clone(), tx_stop);
                         task::spawn(poll_structure(
                             base.clone(),
                             path,
@@ -576,8 +571,7 @@ impl StructurePoller {
 
     pub(crate) async fn start(&mut self, path: Arc<PathBuf>) -> Result<Option<StructureUpdate>> {
         let (tx_init, rx_init) = oneshot::channel();
-        let id = Fid::new();
-        let req = StructureReq::StartPolling(id, path, tx_init);
+        let req = StructureReq::Start(path, tx_init);
         if let Err(_) = self.0.unbounded_send(req) {
             bail!("structure poller is dead")
         }
@@ -588,7 +582,7 @@ impl StructurePoller {
     }
 
     pub(crate) fn stop_by_path(&mut self, path: Arc<PathBuf>) -> Result<()> {
-        if let Err(_) = self.0.unbounded_send(StructureReq::StopByPath(path)) {
+        if let Err(_) = self.0.unbounded_send(StructureReq::Stop(path)) {
             bail!("structure poller is dead")
         }
         Ok(())
