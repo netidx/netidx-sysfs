@@ -500,6 +500,9 @@ async fn main() -> Result<()> {
                 Event::Subscribe(_, _) | Event::Unsubscribe(_, _) => (),
                 Event::Destroyed(id) => {
                     if let Some(pv) = published.published.remove(&id) {
+                        if let Err(e) = file_poller.stop(pv.fid) {
+                            warn!("failed to stop polling {:?}, {}", pv.path, e);
+                        }
                         if let Some(adf) = published.advertised.resolve_mut(&pv.path) {
                             adf.id = None;
                         }
