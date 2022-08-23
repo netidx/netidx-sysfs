@@ -7,7 +7,7 @@ use futures::{
     prelude::*,
     select_biased,
 };
-use fxhash::{FxHashMap, FxHashSet};
+use fxhash::FxHashMap;
 use log::warn;
 use netidx::{
     path::Path,
@@ -16,7 +16,7 @@ use netidx::{
 };
 use netidx_tools::ClientParams;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     mem,
     ops::{Bound, Deref, DerefMut},
     path::PathBuf,
@@ -336,61 +336,32 @@ impl Published {
         *self.used.entry(path.clone()).or_insert_with(Instant::now) = Instant::now();
     }
 
-    fn gc_structure(&mut self, dp: &DefaultHandle, structure_poller: &mut StructurePoller) {
-        dbg!("gc structure");
+    fn gc_structure(&mut self, structure_poller: &mut StructurePoller) {
+        dbg!("gc_structure");
         const TIMEOUT: Duration = Duration::from_secs(60);
-        let mut to_remove: FxHashSet<Path> = HashSet::default();
-        let mut stopped: FxHashSet<Path> = HashSet::default();
-        {
-            let used = &mut self.used;
-            let advertised = &mut self.advertised;
-            used.retain(|path, last| {
-                dbg!(path);
-                last.elapsed() < TIMEOUT || {
-                    let published =
-                        advertised
-                            .children(path)
-                            .any(|(path, _)| match advertised.resolve(path) {
-                                Some(adf) => adf.id.is_some(),
-                                None => false,
-                            });
-                    published || {
-                        dbg!(path);
-                        to_remove.extend(advertised.children(path).map(|(p, _)| p.clone()));
-                        false
-                    }
+        let mut to_remove: Vec<Path> = Vec::new();
+        let used = &mut self.used;
+        let advertised = &mut self.advertised;
+        used.retain(|path, last| {
+            last.elapsed() < TIMEOUT || {
+                let published =
+                    advertised
+                        .children(path)
+                        .any(|(path, _)| match advertised.resolve(path) {
+                            Some(adf) => adf.id.is_some(),
+                            None => false,
+                        });
+                published || {
+                    to_remove.push(path.clone());
+                    false
                 }
-            });
-        }
+            }
+        });
         for path in to_remove {
-            // if the path's immediate parent is still used then we
-            // don't remove it because that would desync the poll.
-            if !Path::dirname(&path)
-                .map(|p| self.used.contains_key(p))
-                .unwrap_or(false)
-            {
-                dp.remove_advertisement(&path);
-                if let Some(adf) = self.advertised.remove(&path) {
-                    let base = match adf.typ {
-                        AType::Directory => path.clone(),
-                        AType::Symlink { .. } | AType::File => {
-                            let base = Path::basename(&path).unwrap_or("/");
-                            stopped
-                                .get(base)
-                                .cloned()
-                                .unwrap_or_else(|| Path::from_str(base))
-                        }
-                    };
-                    if !stopped.contains(&base) {
-                        if let Some(fspath) = self.paths.fs_path(&base) {
-                            if let Err(e) = structure_poller.stop_by_path(Arc::new(fspath)) {
-                                warn!("failed to stop polling directory {}, {}", path, e)
-                            }
-                            stopped.insert(base);
-                        }
-                    }
+            if let Some(fspath) = self.paths.fs_path(&path) {
+                if let Err(e) = structure_poller.stop_by_path(Arc::new(fspath)) {
+                    warn!("failed to stop polling directory {}, {}", path, e)
                 }
-                self.maybe_add_parent_dir_advertisement(dp, &path);
             }
         }
     }
@@ -413,11 +384,12 @@ async fn handle_subscribe_advertised(
                         Ok(()) => (),
                         Err(e) => warn!("failed to alias {}, {}", path, e),
                     },
-                    None => match file_poller.start(adf.fspath.clone()).await {
+                    None => match file_poller.start(dbg!(adf.fspath.clone())).await {
                         Err(e) => warn!("polling file {} failed {}", path, e),
                         Ok((fid, v)) => {
+                            dbg!((fid, &v));
                             let flags = PublishFlags::DESTROY_ON_IDLE;
-                            match publisher.publish_with_flags(flags, path.clone(), v) {
+                            match publisher.publish_with_flags(flags, dbg!(path.clone()), v) {
                                 Err(e) => warn!("failed to publish {}, {}", path, e),
                                 Ok(val) => {
                                     let vid = val.id();
@@ -462,13 +434,13 @@ async fn main() -> Result<()> {
     let mut updates = publisher.start_batch();
     loop {
         select_biased! {
-            _ = gc.tick().fuse() => published.gc_structure(&dp, &mut structure_poller),
+            _ = gc.tick().fuse() => published.gc_structure(&mut structure_poller),
             up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
             (p, reply) = dp.select_next_some() => {
                 match published.advertised.resolve(&p) {
                     Some(AdvertisedFile { typ: AType::Symlink { .. }, .. }) => unreachable!(),
                     Some(AdvertisedFile { typ: AType::File, .. }) => {
-                        dbg!("subscribe advertise");
+                        dbg!(&p);
                         handle_subscribe_advertised(
                             &mut published,
                             &publisher,
@@ -490,13 +462,13 @@ async fn main() -> Result<()> {
                                     sysfs.clone()
                                 }
                             };
-                            dbg!("structure poll start {}", &fspath);
+                            dbg!(&fspath);
                             match structure_poller.start(fspath).await {
                                 Ok(None) => (), // already polling this
                                 Err(e) => warn!("failed to poll {}", e),
                                 Ok(Some(up)) => {
                                     published.advertise(&dp, up);
-                                    dbg!("subscribe advertise");
+                                    dbg!(&p);
                                     handle_subscribe_advertised(
                                         &mut published,
                                         &publisher,
@@ -520,7 +492,7 @@ async fn main() -> Result<()> {
                 }
                 BatchItem::EndBatch => {
                     let up = mem::replace(&mut updates, publisher.start_batch());
-                    dbg!("commit batch");
+                    dbg!("commit");
                     up.commit(timeout).await
                 }
             },

@@ -10,7 +10,7 @@ use futures::{
 };
 use fxhash::FxHashMap;
 use immutable_chunkmap::map::Map as CMap;
-use log::{error, warn};
+use log::{error, info, warn};
 use netidx::{path::Path as NPath, publisher::Value};
 use std::{
     cmp::min, collections::HashMap, ops::Bound, os::linux::fs::MetadataExt, path::PathBuf,
@@ -259,14 +259,18 @@ const SZ: usize = 64;
 
 async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)> {
     const MAX: usize = 512;
+    dbg!(&file);
     let fd = File::open(file).await?;
+    dbg!(&file);
     let mut pos = 0;
     loop {
         let len = buf.len();
         if len - pos < SZ && len < MAX {
             buf.resize(len * 2, 0);
         }
+        dbg!(pos);
         let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
+        dbg!(pos);
         let read = read?;
         if read == 0 {
             buf = res.into_inner();
@@ -289,6 +293,7 @@ pub(crate) async fn poll_file(
     mut clock: broadcast::Receiver<()>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
+    dbg!(&file);
     const MAX_SKIP: u16 = 300;
     const WAIT: Duration = Duration::from_secs(2);
     let mut prev = vec![0; SZ];
@@ -305,13 +310,11 @@ pub(crate) async fn poll_file(
     };
     let mut skip: u16 = 0;
     'main: loop {
-        let (pos, buf_) = if first.is_some() {
-            time::timeout(WAIT, read_file(&file, buf)).await??
-        } else {
-            read_file(&file, buf).await?
-        };
+        let (pos, buf_) = time::timeout(WAIT, read_file(&file, buf)).await??;
         buf = buf_;
-        if prev.len() >= pos && &buf[0..pos] == &prev[0..pos] {
+        if pos == 0 && first.is_some() {
+            send(&mut first, Value::Null)?;
+        } else if prev.len() >= pos && &buf[0..pos] == &prev[0..pos] {
             // backoff polling up to max_skip clocks if we find the
             // file's contents unchanged
             skip = min(MAX_SKIP, skip + 1);
@@ -351,7 +354,7 @@ pub(crate) async fn poll_file(
     }
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub(crate) struct Fid(u32);
 
 impl Fid {
@@ -386,9 +389,20 @@ impl FilePoller {
                     FileReq::StartPolling(id, path, first) => {
                         let clock = clock.subscribe();
                         let (tx_stop, rx_stop) = oneshot::channel();
-                        tokio_uring::spawn(
-                            poll_file(path, id, updates.clone(), first, clock, rx_stop)
-                        );
+                        let updates = updates.clone();
+                        tokio_uring::spawn(async move {
+                            let r = poll_file(
+                                path.clone(),
+                                id,
+                                updates,
+                                first,
+                                clock,
+                                rx_stop
+                            ).await;
+                            if let Err(e) = r {
+                                warn!("file poll died {:?}, {}", path, e)
+                            }
+                        });
                         polling.insert(id, tx_stop);
                     }
                     FileReq::StopPolling(id) => {
@@ -442,22 +456,25 @@ async fn poll_structure(
 ) {
     const MAX_SKIP: u8 = 120;
     const WAIT: Duration = Duration::from_secs(5);
-    let join = task::spawn_blocking({
-        let base = base.clone();
-        let path = path.clone();
-        move || Files::empty().walk(&base, path, 1)
-    });
-    let mut files = match time::timeout(WAIT, join).await {
-        Ok(Ok(files)) => files,
-        Ok(Err(e)) => {
-            warn!("failed to join poll task {:?}, {}", path, e);
-            return;
-        }
-        Err(e) => {
-            warn!("timeout polling {:?}, {}", path, e);
-            return;
+    let poll = || async {
+        let join = task::spawn_blocking({
+            let base = base.clone();
+            let path = path.clone();
+            move || Files::empty().walk(&base, path, 1)
+        });
+        match time::timeout(WAIT, join).await {
+            Ok(Ok(files)) => files,
+            Ok(Err(e)) => {
+                warn!("failed to join poll task {:?}, {}", path, e);
+                Files::empty()
+            }
+            Err(e) => {
+                warn!("timeout polling {:?}, {}", path, e);
+                Files::empty()
+            }
         }
     };
+    let mut files = poll().await;
     let _ = first.send(Some(StructureUpdate {
         current: files.clone(),
         previous: Files::empty(),
@@ -473,7 +490,7 @@ async fn poll_structure(
                     skipped += 1;
                 } else {
                     skipped = 0;
-                    let current = task::block_in_place(|| Files::walk(&files, &base, path.clone(), 1));
+                    let current = poll().await;
                     let previous = files.clone();
                     let changes = previous.diff(&current);
                     files = current.clone();
@@ -492,7 +509,17 @@ async fn poll_structure(
                     }
                 }
             }
-            _ = stop => break,
+            _ = stop => {
+                let previous = files.clone();
+                let current = Files::empty();
+                let changes = previous.diff(&current);
+                let _ = updates.unbounded_send(StructureUpdate {
+                    previous,
+                    current,
+                    changes,
+                });
+                break
+            },
         }
     }
 }
@@ -515,7 +542,7 @@ impl StructurePoller {
         while let Some(r) = req.next().await {
             match r {
                 StructureReq::StopByPath(path) => {
-                    warn!("stop polling {:?}", path);
+                    info!("stop polling {:?}", path);
                     if let Some(id) = by_path.remove(&path) {
                         by_id.remove(&id);
                     }
@@ -524,7 +551,7 @@ impl StructurePoller {
                     if by_path.contains_key(&path) {
                         let _ = initial.send(None);
                     } else {
-                        warn!("start polling {:?}", path);
+                        info!("start polling {:?}", path);
                         by_path.insert(path.clone(), id);
                         let (tx_stop, rx_stop) = oneshot::channel();
                         by_id.insert(id, (path.clone(), tx_stop));
