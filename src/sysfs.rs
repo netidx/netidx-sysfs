@@ -9,7 +9,7 @@ use futures::{
     select_biased,
 };
 use fxhash::FxHashMap;
-use immutable_chunkmap::map::Map as CMap;
+use immutable_chunkmap::map::MapS as Map;
 use log::{error, info, warn};
 use netidx::{path::Path as NPath, publisher::Value};
 use std::{
@@ -19,8 +19,6 @@ use std::{
 use tokio::{sync::broadcast, task, time};
 use tokio_uring::{self, buf::IoBuf, fs::File};
 use triomphe::Arc;
-
-pub(crate) type Map<K, V> = CMap<K, V, 64>;
 
 pub(crate) struct Paths {
     pub(crate) base: Arc<PathBuf>,
@@ -541,6 +539,7 @@ impl StructurePoller {
                     if let Some(stop) = polling.remove(&path) {
                         let _ = stop.send(());
                     }
+                    dbg!(polling.keys());
                 }
                 StructureReq::Start(path, initial) => {
                     if polling.contains_key(&path) {
