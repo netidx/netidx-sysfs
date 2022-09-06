@@ -279,13 +279,29 @@ async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)>
     }
 }
 
+async fn write_file(file: &PathBuf, val: Value) -> Result<()> {
+    let bytes = val.to_string_naked().
+    let bytes = bytes.as_bytes();
+    let fd = File::open(file).await?;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        fd.write_at(pos, &bytes[pos..]).await?;
+    }
+    Ok(())
+}
+
+enum FileReq {
+    Stop,
+    Write(Value, oneshot::Sender<Result<()>>),
+}
+
 pub(crate) async fn poll_file(
     file: Arc<PathBuf>,
     id: Fid,
     updates: UnboundedSender<(Fid, Value)>,
     first: oneshot::Sender<Value>,
     mut clock: broadcast::Receiver<()>,
-    mut stop: oneshot::Receiver<()>,
+    mut input: mpsc::UnboundedReceiver<FileReq>,
 ) -> Result<()> {
     const MAX_SKIP: u16 = 300;
     const WAIT: Duration = Duration::from_secs(2);
@@ -332,12 +348,22 @@ pub(crate) async fn poll_file(
             }
         }
         let mut skipped: u16 = 0;
+        let mut write: Option<(Value, oneshot::Sender<Result<()>>)> = None;
         loop {
             select_biased! {
-                _ = stop => break 'main Ok(()),
+                m = input.select_next_some() => match m {
+                    FileReq::Stop => break 'main Ok(()),
+                    FileReq::Write(v, reply) => { write = Some((v, reply)); }
+                },
                 r = clock.recv().fuse() => if let Err(_) = r {
                     break 'main Ok(());
                 }
+                finished => break 'main Ok(()),
+            }
+            // we delay writes so they happen on the clock edge, so
+            // the syscalls are combined in the best possible batch
+            // size with the reads.
+            if let Some((v, reply)) = write.take() {
             }
             skipped += 1;
             if skipped >= skip {
@@ -359,6 +385,7 @@ impl Fid {
 }
 
 enum FileReq {
+    Write(Fid, Value, oneshot::Sender<Result<()>>),
     StartPolling(Fid, Arc<PathBuf>, oneshot::Sender<Value>),
     StopPolling(Fid),
 }

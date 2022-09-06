@@ -12,8 +12,9 @@ use fxhash::FxHashMap;
 use log::warn;
 use netidx::{
     path::Path,
-    publisher::{BindCfg, DefaultHandle, Event, Id, PublishFlags, Publisher, Val},
+    publisher::{BindCfg, DefaultHandle, Event, Id, PublishFlags, Publisher, Val, WriteRequest},
     utils::{BatchItem, Batched},
+    pool::Pooled,
 };
 use netidx_tools::ClientParams;
 use std::{
@@ -377,6 +378,7 @@ impl Published {
 async fn handle_subscribe_advertised(
     published: &mut Published,
     publisher: &Publisher,
+    writes: &mpsc::Sender<Pooled<Vec<WriteRequest>>>,
     file_poller: &FilePoller,
     path: &Path,
     reply: oneshot::Sender<()>,
@@ -407,6 +409,7 @@ async fn handle_subscribe_advertised(
                                     };
                                     published.published.insert(vid, pf);
                                     published.by_fid.insert(fid, vid);
+                                    publisher.writes(vid, writes.clone());
                                     let _ = reply.send(());
                                 }
                             }
@@ -429,6 +432,7 @@ async fn main() -> Result<()> {
     let (tx_file_updates, rx_file_updates) = mpsc::unbounded();
     let (tx_structure_updates, mut rx_structure_updates) = mpsc::unbounded();
     let (tx_events, mut rx_events) = mpsc::unbounded();
+    let (tx_writes, mut rx_writes) = mpsc::channel(50);
     publisher.events(tx_events);
     let mut rx_file_updates = Batched::new(rx_file_updates, 10_000);
     let sysfs = Arc::new(opts.path);
@@ -449,6 +453,7 @@ async fn main() -> Result<()> {
                         handle_subscribe_advertised(
                             &mut published,
                             &publisher,
+                            &tx_writes,
                             &file_poller,
                             &p,
                             reply
@@ -475,6 +480,7 @@ async fn main() -> Result<()> {
                                     handle_subscribe_advertised(
                                         &mut published,
                                         &publisher,
+                                        &tx_writes,
                                         &file_poller,
                                         &p,
                                         reply
