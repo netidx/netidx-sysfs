@@ -539,7 +539,6 @@ impl StructurePoller {
                     if let Some(stop) = polling.remove(&path) {
                         let _ = stop.send(());
                     }
-                    dbg!(polling.keys());
                 }
                 StructureReq::Start(path, initial) => {
                     if polling.contains_key(&path) {

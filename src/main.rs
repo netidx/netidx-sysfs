@@ -1,6 +1,7 @@
-//mod config;
-mod sysfs;
-use crate::sysfs::{FType, Fid, FilePoller, Paths, StructurePoller, StructureUpdate};
+mod fs;
+use crate::fs::{
+    FType, Fid, FilePoller, Paths, StructureAction, StructureItem, StructurePoller, StructureUpdate,
+};
 use anyhow::Result;
 use futures::{
     channel::{mpsc, oneshot},
@@ -23,7 +24,6 @@ use std::{
     time::Duration,
 };
 use structopt::StructOpt;
-use sysfs::{StructureAction, StructureItem};
 use tokio::{
     self,
     time::{self, Instant},
@@ -46,9 +46,17 @@ struct Params {
         help = "require subscribers to consume values before timeout (seconds)"
     )]
     timeout: Option<u64>,
-    #[structopt(long = "base", help = "the base path to publish under")]
-    base: Path,
-    #[structopt(long = "path", help = "path to the files you want to publish")]
+    #[structopt(
+        long = "netidx-base",
+        help = "the base path to publish under",
+        default_value = "/local/system/sysfs"
+    )]
+    netidx_base: Path,
+    #[structopt(
+        long = "path",
+        help = "path to the files you want to publish",
+        default_value = "/sys"
+    )]
     path: PathBuf,
 }
 
@@ -427,8 +435,8 @@ async fn main() -> Result<()> {
     let file_poller = FilePoller::new(tx_file_updates);
     let mut gc = time::interval(Duration::from_secs(10));
     let mut structure_poller = StructurePoller::new(sysfs.clone(), tx_structure_updates);
-    let mut dp = publisher.publish_default(opts.base.clone())?;
-    let mut published = Published::new(Paths::new(sysfs.clone(), opts.base.clone()));
+    let mut dp = publisher.publish_default(opts.netidx_base.clone())?;
+    let mut published = Published::new(Paths::new(sysfs.clone(), opts.netidx_base.clone()));
     let mut updates = publisher.start_batch();
     loop {
         select_biased! {
