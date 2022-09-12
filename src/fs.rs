@@ -17,7 +17,11 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::broadcast, task, time};
-use tokio_uring::{self, buf::IoBuf, fs::File};
+use tokio_uring::{
+    self,
+    buf::IoBuf,
+    fs::{File, OpenOptions},
+};
 use triomphe::Arc;
 
 pub(crate) struct Paths {
@@ -259,7 +263,7 @@ async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)>
     const MAX: usize = 512;
     let fd = File::open(file).await?;
     let mut pos = 0;
-    loop {
+    let res = loop {
         let len = buf.len();
         if len - pos < SZ && len < MAX {
             buf.resize(len * 2, 0);
@@ -276,32 +280,36 @@ async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)>
                 break Ok((pos, buf)); // we've read as much as we can
             }
         }
-    }
+    };
+    let _ = fd.close().await;
+    res
 }
 
 async fn write_file(file: &PathBuf, val: Value) -> Result<()> {
-    let bytes = val.to_string_naked().
-    let bytes = bytes.as_bytes();
-    let fd = File::open(file).await?;
-    let mut pos = 0;
-    while pos < bytes.len() {
-        fd.write_at(pos, &bytes[pos..]).await?;
+    let mut buf = val.to_string_naked().into_bytes();
+    let fd = OpenOptions::new().write(true).open(file).await?;
+    let mut pos: usize = 0;
+    while pos < buf.len() {
+        let (written, res) = fd.write_at(buf.slice(pos..), pos as u64).await;
+        pos += written?;
+        buf = res.into_inner();
     }
+    let _ = fd.close().await;
     Ok(())
 }
 
-enum FileReq {
+enum PollFileReq {
     Stop,
     Write(Value, oneshot::Sender<Result<()>>),
 }
 
-pub(crate) async fn poll_file(
+async fn poll_file(
     file: Arc<PathBuf>,
     id: Fid,
     updates: UnboundedSender<(Fid, Value)>,
     first: oneshot::Sender<Value>,
     mut clock: broadcast::Receiver<()>,
-    mut input: mpsc::UnboundedReceiver<FileReq>,
+    mut input: mpsc::UnboundedReceiver<PollFileReq>,
 ) -> Result<()> {
     const MAX_SKIP: u16 = 300;
     const WAIT: Duration = Duration::from_secs(2);
@@ -352,22 +360,31 @@ pub(crate) async fn poll_file(
         loop {
             select_biased! {
                 m = input.select_next_some() => match m {
-                    FileReq::Stop => break 'main Ok(()),
-                    FileReq::Write(v, reply) => { write = Some((v, reply)); }
+                    PollFileReq::Stop => break 'main Ok(()),
+                    PollFileReq::Write(v, reply) => { write = Some((v, reply)); }
                 },
                 r = clock.recv().fuse() => if let Err(_) = r {
                     break 'main Ok(());
-                }
-                finished => break 'main Ok(()),
+                },
+                complete => break 'main Ok(()),
             }
-            // we delay writes so they happen on the clock edge, so
-            // the syscalls are combined in the best possible batch
-            // size with the reads.
+            // we delay writes so they happen on the clock edge along
+            // with reads, for best syscall batching with io uring.
             if let Some((v, reply)) = write.take() {
-            }
-            skipped += 1;
-            if skipped >= skip {
-                break;
+                let r = match time::timeout(WAIT, write_file(&*file, v))
+                    .await
+                    .map_err(anyhow::Error::from)
+                {
+                    Err(e) => Err(e),
+                    Ok(Err(e)) => Err(e),
+                    Ok(Ok(())) => Ok(()),
+                };
+                let _ = reply.send(r);
+            } else {
+                skipped += 1;
+                if skipped >= skip {
+                    break;
+                }
             }
         }
     }
@@ -398,7 +415,7 @@ impl FilePoller {
         mut req: UnboundedReceiver<FileReq>,
     ) -> Result<()> {
         let (clock, _) = broadcast::channel(3);
-        let mut polling: FxHashMap<Fid, oneshot::Sender<()>> = HashMap::default();
+        let mut polling: FxHashMap<Fid, mpsc::UnboundedSender<PollFileReq>> = HashMap::default();
         let mut clock_timer = time::interval(Duration::from_secs(1));
         loop {
             select_biased! {
@@ -406,9 +423,12 @@ impl FilePoller {
                     let _ = clock.send(());
                 }
                 r = req.select_next_some() => match r {
+                    FileReq::Write(id, v, reply) => if let Some(chan) = polling.get(&id) {
+                        let _ = chan.unbounded_send(PollFileReq::Write(v, reply));
+                    }
                     FileReq::StartPolling(id, path, first) => {
                         let clock = clock.subscribe();
-                        let (tx_stop, rx_stop) = oneshot::channel();
+                        let (tx_req, rx_req) = mpsc::unbounded();
                         let updates = updates.clone();
                         tokio_uring::spawn(async move {
                             let r = poll_file(
@@ -417,17 +437,17 @@ impl FilePoller {
                                 updates,
                                 first,
                                 clock,
-                                rx_stop
+                                rx_req
                             ).await;
                             if let Err(e) = r {
                                 warn!("file poll died {:?}, {}", path, e)
                             }
                         });
-                        polling.insert(id, tx_stop);
+                        polling.insert(id, tx_req);
                     }
                     FileReq::StopPolling(id) => {
                         if let Some(stop) = polling.remove(&id) {
-                            let _ = stop.send(());
+                            let _ = stop.unbounded_send(PollFileReq::Stop);
                         }
                     }
                 }
@@ -463,6 +483,14 @@ impl FilePoller {
         match self.0.unbounded_send(FileReq::StopPolling(id)) {
             Ok(()) => Ok(()),
             Err(_) => bail!("file poller dead"),
+        }
+    }
+
+    pub(crate) async fn write(&self, id: Fid, value: Value) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        match self.0.unbounded_send(FileReq::Write(id, value, tx)) {
+            Err(_) => bail!("file poller dead"),
+            Ok(()) => rx.await?,
         }
     }
 }

@@ -11,10 +11,13 @@ use futures::{
 use fxhash::FxHashMap;
 use log::warn;
 use netidx::{
+    chars::Chars,
     path::Path,
-    publisher::{BindCfg, DefaultHandle, Event, Id, PublishFlags, Publisher, Val, WriteRequest},
-    utils::{BatchItem, Batched},
     pool::Pooled,
+    publisher::{
+        BindCfg, DefaultHandle, Event, Id, PublishFlags, Publisher, Val, Value, WriteRequest,
+    },
+    utils::{BatchItem, Batched},
 };
 use netidx_tools::ClientParams;
 use std::{
@@ -422,6 +425,38 @@ async fn handle_subscribe_advertised(
     }
 }
 
+async fn handle_writes(
+    poller: &FilePoller,
+    published: &Published,
+    mut reqs: Pooled<Vec<WriteRequest>>,
+) {
+    macro_rules! send_result {
+        ($req:expr, $v:expr) => {
+            if let Some(send) = $req.send_result {
+                send.send($v);
+            }
+        };
+    }
+    futures::future::join_all(reqs.drain(..).map(|req| async move {
+        match published.advertised.resolve(&req.path) {
+            None => send_result!(req, Value::Error(Chars::from("no such file"))),
+            Some(AdvertisedFile {
+                fspath: _,
+                typ: AType::File,
+                id: Some(id),
+            }) => match published.published.get(&id) {
+                None => send_result!(req, Value::Error(Chars::from("no such file"))),
+                Some(p) => match poller.write(p.fid, req.value).await {
+                    Ok(()) => send_result!(req, Value::Ok),
+                    Err(e) => send_result!(req, Value::Error(Chars::from(format!("{}", e)))),
+                },
+            },
+            Some(_) => send_result!(req, Value::Error(Chars::from("not a file"))),
+        }
+    }))
+    .await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -446,6 +481,7 @@ async fn main() -> Result<()> {
         select_biased! {
             _ = gc.tick().fuse() => published.gc_structure(&mut structure_poller),
             up = rx_structure_updates.select_next_some() => published.advertise(&dp, up),
+            reqs = rx_writes.select_next_some() => handle_writes(&file_poller, &published, reqs).await,
             (p, reply) = dp.select_next_some() => {
                 match published.advertised.resolve(&p) {
                     Some(AdvertisedFile { typ: AType::Symlink { .. }, .. }) => unreachable!(),
