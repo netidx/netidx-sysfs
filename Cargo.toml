@@ -25,6 +25,5 @@ serde = "1"
 serde_derive = "1"
 serde_json = "1"
 structopt = "0.3"
-tokio-uring = "0.3"
 tokio = { version = "1", features = ["full"] }
 triomphe = "0.1"

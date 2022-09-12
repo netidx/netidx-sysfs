@@ -16,12 +16,7 @@ use std::{
     cmp::min, collections::HashMap, ops::Bound, os::linux::fs::MetadataExt, path::PathBuf,
     time::Duration,
 };
-use tokio::{sync::broadcast, task, time};
-use tokio_uring::{
-    self,
-    buf::IoBuf,
-    fs::{File, OpenOptions},
-};
+use tokio::{fs::File, io::AsyncReadExt, sync::broadcast, task, time};
 use triomphe::Arc;
 
 pub(crate) struct Paths {
@@ -260,42 +255,28 @@ impl Files {
 const SZ: usize = 64;
 
 async fn read_file(file: &PathBuf, mut buf: Vec<u8>) -> Result<(usize, Vec<u8>)> {
-    const MAX: usize = 512;
-    let fd = File::open(file).await?;
+    const MAX: usize = 1024;
+    let mut fd = File::open(file).await?;
     let mut pos = 0;
-    let res = loop {
+    loop {
         let len = buf.len();
         if len - pos < SZ && len < MAX {
             buf.resize(len * 2, 0);
         }
-        let (read, res) = fd.read_at(buf.slice(pos..), pos as u64).await;
-        let read = read?;
+        let read = fd.read(&mut buf[pos..]).await?;
         if read == 0 {
-            buf = res.into_inner();
             break Ok((pos, buf));
         } else {
-            buf = res.into_inner();
             pos += read;
             if pos >= MAX {
                 break Ok((pos, buf)); // we've read as much as we can
             }
         }
-    };
-    let _ = fd.close().await;
-    res
+    }
 }
 
 async fn write_file(file: &PathBuf, val: Value) -> Result<()> {
-    let mut buf = val.to_string_naked().into_bytes();
-    let fd = OpenOptions::new().write(true).open(file).await?;
-    let mut pos: usize = 0;
-    while pos < buf.len() {
-        let (written, res) = fd.write_at(buf.slice(pos..), pos as u64).await;
-        pos += written?;
-        buf = res.into_inner();
-    }
-    let _ = fd.close().await;
-    Ok(())
+    Ok(tokio::fs::write(file, &val.to_string_naked().into_bytes()).await?)
 }
 
 enum PollFileReq {
@@ -430,7 +411,7 @@ impl FilePoller {
                         let clock = clock.subscribe();
                         let (tx_req, rx_req) = mpsc::unbounded();
                         let updates = updates.clone();
-                        tokio_uring::spawn(async move {
+                        task::spawn(async move {
                             let r = poll_file(
                                 path.clone(),
                                 id,
@@ -457,12 +438,10 @@ impl FilePoller {
 
     pub(crate) fn new(updates: UnboundedSender<(Fid, Value)>) -> Self {
         let (tx_req, rx_req) = mpsc::unbounded();
-        std::thread::spawn(move || {
-            tokio_uring::start(async move {
-                if let Err(e) = Self::run(updates, rx_req).await {
-                    error!("file poller failed {}", e)
-                }
-            })
+        task::spawn(async move {
+            if let Err(e) = Self::run(updates, rx_req).await {
+                error!("file poller failed {}", e)
+            }
         });
         Self(tx_req)
     }
