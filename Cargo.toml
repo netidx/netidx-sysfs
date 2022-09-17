@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "An on demand publisher of sysfs/procfs"
 readme = "README.md"
+license = "MIT"
 
 [profile.release]
 codegen-units = 1
