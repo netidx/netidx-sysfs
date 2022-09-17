@@ -37,3 +37,9 @@ see everything, or run as root for full access. E.G.
 ```
 
 will publish sysfs to `/local/system/sysfs`
+
+Of course you are not limited to publishing locally, you could publish
+every machine on your network's sysfs to netidx so you can read
+manipulate values over the network while enjoying encryption,
+authentication, and authorization provided by netidx and your kerberos
+v5 infrastructure.
