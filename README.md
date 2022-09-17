@@ -27,6 +27,8 @@ netidx-sysfs behaves in the following potentially unexpected ways,
   ones. Not at all limited to sysfs/procfs, just tailored to that use
   case.
 
+## Setup
+
 To setup `cargo install netidx-sysfs` and make sure you have a netidx
 resolver either on the local machine or somewhere on the network. To
 run, either run as a regular user, in which case you won't be able to
@@ -43,3 +45,12 @@ every machine on your network's sysfs to netidx so you can read and
 manipulate values over the network while enjoying strong encryption,
 authentication, and authorization provided by netidx and your kerberos
 v5 infrastructure.
+
+## Browsing
+
+Because the resolver and browser automatically infer table structure
+from regular tree structure, many of the things in sysfs and procfs
+will be automatically formatted as tables. For example, here is a look
+at my `/sys/block`
+
+![sysfs](sysfs.png)
