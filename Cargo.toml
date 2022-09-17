@@ -2,7 +2,8 @@
 name = "netidx-sysfs"
 version = "0.1.0"
 edition = "2021"
-description = "An on demand publisher of sysfs/procfs using io uring"
+description = "An on demand publisher of sysfs/procfs"
+readme = "README.md"
 
 [profile.release]
 codegen-units = 1
