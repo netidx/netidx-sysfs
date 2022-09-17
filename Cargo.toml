@@ -1,10 +1,13 @@
 [package]
 name = "netidx-sysfs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "An on demand publisher of sysfs/procfs"
+repository = "https://github.com/estokes/netidx-sysfs"
 readme = "README.md"
 license = "MIT"
+keywords = ["network", "networking", "distributed", "kerberos"]
+categories = ["command-line-utilities"]
 
 [profile.release]
 codegen-units = 1
