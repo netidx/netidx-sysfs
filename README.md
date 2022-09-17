@@ -28,4 +28,12 @@ netidx-sysfs behaves in the following potentially unexpected ways,
   case.
 
 To setup `cargo install netidx-sysfs` and make sure you have a netidx
-resolver either on the local machine or somewhere on the network.
+resolver either on the local machine or somewhere on the network. To
+run, either run as a regular user, in which case you won't be able to
+see everything, or run as root for full access. E.G.
+
+```
+# netidx-sysfs -a local -b local --netidx-base /local/system/sysfs --path /sys
+```
+
+will publish sysfs to `/local/system/sysfs`
