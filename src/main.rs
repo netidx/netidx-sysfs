@@ -19,7 +19,7 @@ use netidx::{
     },
     utils::{BatchItem, Batched},
 };
-use netidx_tools::ClientParams;
+use netidx_tools_core::ClientParams;
 use std::{
     collections::{BTreeMap, HashMap},
     mem,

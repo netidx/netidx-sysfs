@@ -1,6 +1,6 @@
 [package]
 name = "netidx-sysfs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "An on demand publisher of sysfs/procfs"
 repository = "https://github.com/estokes/netidx-sysfs"
@@ -24,7 +24,7 @@ fxhash = "0.2"
 globset = "0.4"
 immutable-chunkmap = "1"
 log = "0.4"
-netidx-tools = {version = "0.12", path = "../netidx/netidx-tools" }
+netidx-tools-core = {version = "0.12", path = "../netidx/netidx-tools-core" }
 netidx = { version = "0.12", path = "../netidx/netidx" }
 serde = "1"
 serde_derive = "1"
