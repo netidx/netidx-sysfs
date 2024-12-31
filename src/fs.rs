@@ -103,7 +103,7 @@ impl Files {
     ) {
         let children = self
             .paths
-            .range(Bound::Excluded(Arc::new(base.clone())), Bound::Unbounded)
+            .range((Bound::Excluded(Arc::new(base.clone())), Bound::Unbounded))
             .take_while(|(p, _)| p.starts_with(base))
             .filter_map(|(p, t)| p.strip_prefix(base).ok().map(|p| (p, t)));
         for (p, t) in children {

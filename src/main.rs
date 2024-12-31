@@ -15,7 +15,8 @@ use netidx::{
     path::Path,
     pool::Pooled,
     publisher::{
-        BindCfg, DefaultHandle, Event, Id, PublishFlags, Publisher, Val, Value, WriteRequest,
+        BindCfg, DefaultHandle, Event, Id, PublishFlags, Publisher, PublisherBuilder, Val, Value,
+        WriteRequest,
     },
     utils::{BatchItem, Batched},
 };
@@ -463,7 +464,11 @@ async fn main() -> Result<()> {
     let opts = Params::from_args();
     let (cfg, auth) = opts.common.load();
     let timeout = opts.timeout.map(Duration::from_secs);
-    let publisher = Publisher::new(cfg, auth, opts.bind).await?;
+    let publisher = PublisherBuilder::new(cfg)
+        .desired_auth(auth)
+        .bind_cfg(Some(opts.bind))
+        .build()
+        .await?;
     let (tx_file_updates, rx_file_updates) = mpsc::unbounded();
     let (tx_structure_updates, mut rx_structure_updates) = mpsc::unbounded();
     let (tx_events, mut rx_events) = mpsc::unbounded();
